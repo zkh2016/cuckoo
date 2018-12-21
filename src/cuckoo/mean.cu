@@ -57,7 +57,7 @@ __device__ __forceinline__ ulonglong4 Pack8(const u32 e0, const u32 e1, const u3
 #endif
 
 template<int maxOut, typename EdgeOut>
-__global__ void SeedA(const siphash_keys &sipkeys, ulonglong4 * __restrict__ buffer, int * __restrict__ indexes) {
+__global__ void SeedA(const siphash_keys &sipkeys, ulonglong4 * __restrict__ buffer, int * __restrict__ indexes/*, unsigned int *hash_count, int *nonce_hash_count*/) {
   const int group = blockIdx.x;
   const int dim = blockDim.x;
   const int lid = threadIdx.x;
@@ -80,6 +80,9 @@ __global__ void SeedA(const siphash_keys &sipkeys, ulonglong4 * __restrict__ buf
     u32 node1, node0 = dipnode(sipkeys, (u64)nonce, 0);
     if (sizeof(EdgeOut) == sizeof(uint2))
       node1 = dipnode(sipkeys, (u64)nonce, 1);
+   // atomicAdd(hash_count, 2);
+   // atomicAdd(nonce_hash_count + nonce, 1);
+
     int row = node0 & XMASK;
     int counter = min((int)atomicAdd(counters + row, 1), (int)(FLUSHA2-1));
     tmp[row][counter] = make_Edge(nonce, tmp[0][0], node0, node1);
@@ -338,7 +341,7 @@ struct trimparams {
 
   trimparams() {
     expand              =    0;
-    ntrims              =  176;
+    ntrims              =  256;
     genA.blocks         = 4096;
     genA.tpb            =  256;
     genB.blocks         =  NX2;
@@ -413,17 +416,41 @@ struct edgetrimmer {
     cudaDeviceSynchronize();
     float durationA, durationB;
     cudaEventRecord(start, NULL);
-  
+ 
+    /*unsigned int *dev_hash_count;
+   cudaMalloc((void**)&dev_hash_count, sizeof(unsigned int)); 
+	int *nonce_hash_count = (int*)malloc(sizeof(int) * NEDGES);
+	int *dev_nonce_hash_count;
+	cudaMalloc((void**)&dev_nonce_hash_count, sizeof(int) * NEDGES);
+*/
     if (tp.expand == 0)
-      SeedA<EDGES_A, uint2><<<tp.genA.blocks, tp.genA.tpb>>>(*dipkeys, bufferAB, (int *)indexesE);
+      SeedA<EDGES_A, uint2><<<tp.genA.blocks, tp.genA.tpb>>>(*dipkeys, bufferAB, (int *)indexesE/*, dev_hash_count, dev_nonce_hash_count*/);
     else
-      SeedA<EDGES_A,   u32><<<tp.genA.blocks, tp.genA.tpb>>>(*dipkeys, bufferAB, (int *)indexesE);
+      SeedA<EDGES_A,   u32><<<tp.genA.blocks, tp.genA.tpb>>>(*dipkeys, bufferAB, (int *)indexesE/*, dev_hash_count, dev_nonce_hash_count*/);
   
     checkCudaErrors(cudaDeviceSynchronize()); cudaEventRecord(stop, NULL);
     cudaEventSynchronize(stop); cudaEventElapsedTime(&durationA, start, stop);
     if (abort) return false;
     cudaEventRecord(start, NULL);
-  
+
+//    unsigned int hash_count = 0;
+//    cudaMemcpy(&hash_count, dev_hash_count, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+//    printf("hash_count = %u\n", hash_count);
+		
+    /*cudaMemcpy(nonce_hash_count, dev_nonce_hash_count, sizeof(int) * NEDGES/64, cudaMemcpyDeviceToHost);
+
+	FILE*fp = fopen("cuckoo_nonce_hash_count.txt", "w");
+	if(fp == NULL) return 0;
+	for(int i = 0; i < NEDGES; i++){
+		//for(int j = 0; j < 64; j++)
+		{
+			fprintf(fp, "%d %d\n", i, nonce_hash_count[i]);		
+		}
+	}
+	fclose(fp);
+	cudaFree(dev_nonce_hash_count);
+	cudaFree(dev_hash_count);
+  */
     const u32 halfA = sizeA/2 / sizeof(ulonglong4);
     const u32 halfE = NX2 / 2;
     if (tp.expand == 0) {
@@ -545,7 +572,7 @@ struct solver_ctx {
   u32 vs[MAXPATHLEN];
 
   solver_ctx(const trimparams tp, bool mutate_nonce) : trimmer(tp) {
-    edges   = new uint2[MAXEDGES];
+    edges   = new uint2[MAXEDGES*100];
     cuckoo  = new cuckoo_hash();
     mutatenonce = mutate_nonce;
   }
@@ -555,6 +582,7 @@ struct solver_ctx {
       ((u32 *)headernonce)[len/sizeof(u32)-1] = htole32(nonce); // place nonce at end
     }
     setheader(headernonce, len, &trimmer.sipkeys);
+
     sols.clear();
   }
   ~solver_ctx() {
@@ -634,19 +662,22 @@ struct solver_ctx {
       addedge(edges[i]);
   }
 
-  int solve() {
+  int solve(FILE *fcount, int r) {
     u32 timems,timems2;
     struct timeval time0, time1;
 
     trimmer.abort = false;
     gettimeofday(&time0, 0);
+    printf("%lu, %lu, %lu, %lu\n", trimmer.sipkeys.k0, trimmer.sipkeys.k1, trimmer.sipkeys.k2, trimmer.sipkeys.k3);
+    trimmer.tp.ntrims -= 1;
     u32 nedges = trimmer.trim();
+    printf("trim result: %u\n", nedges);
     if (!nedges)
       return 0;
-    if (nedges > MAXEDGES) {
+    /*if (nedges > MAXEDGES) {
       print_log("OOPS; losing %d edges beyond MAXEDGES=%d\n", nedges-MAXEDGES, MAXEDGES);
       nedges = MAXEDGES;
-    }
+    }*/
     cudaMemcpy(edges, trimmer.bufferB, nedges * 8, cudaMemcpyDeviceToHost);
     gettimeofday(&time1, 0);
     timems = (time1.tv_sec-time0.tv_sec)*1000 + (time1.tv_usec-time0.tv_usec)/1000;
@@ -655,6 +686,7 @@ struct solver_ctx {
     gettimeofday(&time1, 0);
     timems2 = (time1.tv_sec-time0.tv_sec)*1000 + (time1.tv_usec-time0.tv_usec)/1000;
     print_log("findcycles edges %d time %d ms total %d ms\n", nedges, timems2, timems+timems2);
+    fprintf(fcount, "%d %d %.3f %.3f\n", trimmer.tp.ntrims, nedges, timems/1000.0, timems2/1000.0);
     return sols.size() / PROOFSIZE;
   }
 
@@ -702,11 +734,24 @@ CALL_CONVENTION int run_solver(SolverCtx* ctx,
     return 0;
   }
 
+	unsigned long long k0 = 0xa34c6a2bdaa03a14ULL;
+	unsigned long long k1 = 0xd736650ae53eee9eULL;
+	unsigned long long k2 = 0x9a22f05e3bffed5eULL;
+	unsigned long long k3 = 0xb8d55478fa3a606dULL;
+	ctx->trimmer.sipkeys.k0 = k0;
+	ctx->trimmer.sipkeys.k1 = k1;
+	ctx->trimmer.sipkeys.k2 = k2;
+	ctx->trimmer.sipkeys.k3 = k3;
+
+  FILE *fcount = fopen("cuckoo_mean.txt", "w");
+  range = 1;
   for (u32 r = 0; r < range; r++) {
     time0 = timestamp();
     ctx->setheadernonce(header, header_length, nonce + r);
     print_log("nonce %d k0 k1 k2 k3 %llx %llx %llx %llx\n", nonce+r, ctx->trimmer.sipkeys.k0, ctx->trimmer.sipkeys.k1, ctx->trimmer.sipkeys.k2, ctx->trimmer.sipkeys.k3);
-    u32 nsols = ctx->solve();
+    
+    u32 nsols = ctx->solve(fcount, r);
+
     time1 = timestamp();
     timems = (time1 - time0) / 1000000;
     print_log("Time: %d ms\n", timems);
@@ -798,6 +843,7 @@ CALL_CONVENTION void fill_default_params(SolverParams* params) {
 }
 
 int main(int argc, char **argv) {
+	clock_t start = clock();
   trimparams tp;
   u32 nonce = 0;
   u32 range = 1;
@@ -886,5 +932,7 @@ int main(int argc, char **argv) {
 
   run_solver(ctx, header, sizeof(header), nonce, range, NULL, NULL);
 
+  clock_t end = clock();
+  printf("all time : %.4f\n", (double)(end-start)/CLOCKS_PER_SEC);
   return 0;
 }

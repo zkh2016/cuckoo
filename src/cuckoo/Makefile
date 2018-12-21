@@ -13,13 +13,24 @@ CFLAGS ?= -Wall -Wno-format -fomit-frame-pointer $(OPT)
 GCC ?= gcc $(GCC_ARCH_FLAGS) -std=gnu11 $(CFLAGS)
 BLAKE_2B_SRC ?= ../crypto/blake2b-ref.c
 
-all : simpletest leantest
+all : lcudatest lcudatest2 cudatest
+#all: lcudatest2
+#all: simpletest
 
-simpletest:     simple19
-	./simple19 -n 38
+simpletest:     simple29
+	./simple29 -n 38
 
-leantest:       lean19x1
-	./lean19x1 -n 38
+leantest:       lean29x8
+	./lean29x8 -n 38
+
+lcudatest: lcuda29
+	./lcuda29
+
+lcudatest2: lcuda29_2
+	./lcuda29_2
+
+cudatest: cuda29
+	./cuda29
 
 verifytest:     lean19x1 verify19
 	./lean19x1 -n 38 | grep ^Sol | ./verify19 -n 38
@@ -55,7 +66,9 @@ mean29x1:	cuckoo.h ../crypto/siphash.h mean.hpp mean.cpp Makefile
 	$(GPP) -o $@ -DNSIPHASH=1 -DEDGEBITS=29 mean.cpp $(BLAKE_2B_SRC)
 
 lcuda29:	../crypto/siphash.cuh lean.cu Makefile
-	nvcc -o $@ -DEDGEBITS=29 -arch sm_35 lean.cu $(BLAKE_2B_SRC)
+	nvcc -g -o $@ -DEDGEBITS=29 -arch sm_35 lean.cu $(BLAKE_2B_SRC)
+lcuda29_2:	../crypto/siphash.cuh lean2.cu Makefile
+	nvcc -g -o $@ -DEDGEBITS=29 -arch sm_35 lean2.cu $(BLAKE_2B_SRC)
 
 cuda29:		../crypto/siphash.cuh mean.cu Makefile
-	nvcc -o $@ -DEDGEBITS=29 -arch sm_35 mean.cu $(BLAKE_2B_SRC)
+	nvcc -g -o $@ -DEDGEBITS=29 -arch sm_35 mean.cu $(BLAKE_2B_SRC)

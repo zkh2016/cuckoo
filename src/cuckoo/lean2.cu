@@ -41,6 +41,11 @@
 // grow with cube root of size, hardly affected by trimming
 #define MAXPATHLEN (8 << (NODEBITS/3))
 
+#ifndef EDGE_BLOCK_BITS
+#define EDGE_BLOCK_BITS 6
+#endif
+#define EDGE_BLOCK_SIZE (1 << EDGE_BLOCK_BITS)
+#define EDGE_BLOCK_MASK (EDGE_BLOCK_SIZE - 1)
 #define checkCudaErrors(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert (cudaError_t code, const char *file, int line, bool abort = true)
 {
@@ -65,9 +70,11 @@ class shrinkingset
 	{
 		return !((bits[n / 32] >> (n % 32)) & 1);
 	}
-	__device__ u32 block (word_t n) const
+	__device__ u64 block (word_t n) const
 	{
-		return ~bits[n / 32];
+		u64 r = *(u64 *) & bits[n / 32];
+		//  return ~bits[n/32;
+		  return ~r;
 	}
 };
 
@@ -180,53 +187,126 @@ class cuckoo_ctx
 	{
 		((u32 *) headernonce)[HEADERLEN / sizeof (u32) - 1] = htole32 (nonce);	// place nonce at end
 		setheader (headernonce, HEADERLEN, &sip_keys);
-
 	}
 };
 
-__global__ void count_node_deg (cuckoo_ctx * ctx, u32 uorv, u32 part, unsigned long long int *hash_count, unsigned long long int *rw_count)
+__device__ u64 dipblock (const siphash_keys & keys, const word_t edge, u64 * buf)
+{
+	u64 v0 = keys.k0, v1 = keys.k1, v2 = keys.k2, v3 = keys.k3;
+	word_t edge0 = edge & ~EDGE_BLOCK_MASK;
+	u32 i;
+	for (i = 0; i < EDGE_BLOCK_MASK; i++)
+	{
+		word_t nonce = edge0 + i;
+		v3 ^= nonce;
+		SIPROUND;
+		SIPROUND;
+		v0 ^= nonce;
+		v2 ^= 0xff;
+		SIPROUND;
+		SIPROUND;
+		SIPROUND;
+		SIPROUND;
+		buf[i] = (v0 ^ v1) ^ (v2 ^ v3);
+	}
+	word_t nonce = edge0 + i;
+	v3 ^= nonce;
+	SIPROUND;
+	SIPROUND;
+	v0 ^= nonce;
+	v2 ^= 0xff;
+	SIPROUND;
+	SIPROUND;
+	SIPROUND;
+	SIPROUND;
+
+	buf[i] = 0;
+	return (v0 ^ v1) ^ (v2 ^ v3);
+}
+
+/*
+__global__ void count_node_deg(cuckoo_ctx *ctx, u32 uorv, u32 part) {
+  shrinkingset &alive = ctx->alive;
+  twice_set &nonleaf = ctx->nonleaf;
+  siphash_keys sip_keys = ctx->sip_keys; // local copy sip context; 2.5% speed gain
+  int id = blockIdx.x * blockDim.x + threadIdx.x;
+  for (u32 block = id*64; block < NEDGES; block += ctx->nthreads*64) {
+    u64 alive32 = alive.block(block);
+    for (u32 nonce = block-1; alive32; ) { // -1 compensates for 1-based ffs
+      u32 ffs = __ffsll(alive32);
+      nonce += ffs; alive32 >>= ffs;
+      u32 u = dipnode(sip_keys, nonce, uorv);
+      if ((u & PART_MASK) == part) {
+        nonleaf.set(u >> PART_BITS);
+      }
+    }
+  }
+}*/
+
+__global__ void count_node_deg (cuckoo_ctx * ctx, u32 uorv, u32 part, unsigned long long int *hash_count, int* nonce_hash_count, unsigned long long int *rw_count)
 {
 	shrinkingset & alive = ctx->alive;
 	twice_set & nonleaf = ctx->nonleaf;
 	siphash_keys sip_keys = ctx->sip_keys;	// local copy sip context; 2.5% speed gain
 	int id = blockIdx.x * blockDim.x + threadIdx.x;
-	for (word_t block = id * 32; block < NEDGES; block += ctx->nthreads * 32)
+	u64 buf[64];
+	for (u32 block = id * 64; block < NEDGES; block += ctx->nthreads * 64)
 	{
-		u32 alive32 = alive.block (block);
-		//atomicAdd(rw_count, 1);
-		for (word_t nonce = block - 1; alive32;)
+		u64 alive64 = alive.block (block);
+		u64 last = 0;
+		if(alive64) // if commenting this code, will more quickly
+		{
+			last = dipblock (sip_keys, block, buf);
+	//		atomicAdd(hash_count, 64);
+	//		atomicAdd(rw_count, 64);
+		//	atomicAdd(nonce_hash_count + block/64, 1);
+		}
+		for (u32 nonce = block - 1; alive64;)
 		{						// -1 compensates for 1-based ffs
-			u32 ffs = __ffs (alive32);
+			u32 ffs = __ffsll (alive64);
 			nonce += ffs;
-			alive32 >>= ffs;
-			word_t u = dipnode (sip_keys, nonce, uorv);
-			//atomicAdd(hash_count, 1);
+			alive64 >>= ffs;
+
+			u64 edge = buf[nonce - block] ^ last;
+			u32 u = (edge >> (uorv ? 32 : 0)) & EDGEMASK;
+
 			if ((u & PART_MASK) == part)
 			{
 				nonleaf.set (u >> PART_BITS);
-				//atomicAdd(rw_count, 1);
+			//	atomicAdd(rw_count, 1);
 			}
+
 		}
 	}
 }
 
-__global__ void kill_leaf_edges (cuckoo_ctx * ctx, u32 uorv, u32 part, unsigned long long int *hash_count, unsigned long long int *rw_count)
+__global__ void kill_leaf_edges (cuckoo_ctx * ctx, u32 uorv, u32 part, unsigned long long int* hash_count, int* nonce_hash_count, unsigned long long int *rw_count)
 {
 	shrinkingset & alive = ctx->alive;
 	twice_set & nonleaf = ctx->nonleaf;
 	siphash_keys sip_keys = ctx->sip_keys;
 	int id = blockIdx.x * blockDim.x + threadIdx.x;
-	for (word_t block = id * 32; block < NEDGES; block += ctx->nthreads * 32)
+	u64 buf[64];
+	for (u32 block = id * 64; block < NEDGES; block += ctx->nthreads * 64)
 	{
-		u32 alive32 = alive.block (block);
-		//atomicAdd(rw_count, 1);
-		for (word_t nonce = block - 1; alive32;)
+		u64 alive64 = alive.block (block);
+		u64 last = 0;
+		if(alive64)
+		{
+			last = dipblock (sip_keys, block, buf);
+		//	atomicAdd(hash_count, 64);
+		//	atomicAdd(rw_count, 64);
+		//	atomicAdd(nonce_hash_count + block/64, 1);
+		}
+		for (u32 nonce = block - 1; alive64;)
 		{						// -1 compensates for 1-based ffs
-			u32 ffs = __ffs (alive32);
+			u32 ffs = __ffsll (alive64);
 			nonce += ffs;
-			alive32 >>= ffs;
-			word_t u = dipnode (sip_keys, nonce, uorv);
-			//atomicAdd(hash_count, 1);
+			alive64 >>= ffs;
+
+			u64 edge = buf[nonce - block] ^ last;
+			u32 u = (edge >> (uorv ? 32 : 0)) & EDGEMASK;
+
 			if ((u & PART_MASK) == part)
 			{
 				if (!nonleaf.test (u >> PART_BITS))
@@ -240,39 +320,23 @@ __global__ void kill_leaf_edges (cuckoo_ctx * ctx, u32 uorv, u32 part, unsigned 
 }
 
 /*
-__global__ void count_node_deg(cuckoo_ctx *ctx, u32 uorv, u32 part) {
-  shrinkingset &alive = ctx->alive;
-  twice_set &nonleaf = ctx->nonleaf;
-  siphash_keys sip_keys = ctx->sip_keys; // local copy sip context; 2.5% speed gain
-  int id = blockIdx.x * blockDim.x + threadIdx.x;
-  int loops = NEDGES/ctx->nthreads;
-  for (word_t block = 0; block < loops; block += 1) {
-      word_t nonce = id*loops + block;
-      if(alive.test(nonce)){
-      word_t u = dipnode(sip_keys, nonce, uorv);
-      if ((u & PART_MASK) == part) {
-        nonleaf.set(u >> PART_BITS);
-      }
-      }
-  }
-}
-
 __global__ void kill_leaf_edges(cuckoo_ctx *ctx, u32 uorv, u32 part) {
   shrinkingset &alive = ctx->alive;
   twice_set &nonleaf = ctx->nonleaf;
   siphash_keys sip_keys = ctx->sip_keys;
   int id = blockIdx.x * blockDim.x + threadIdx.x;
-  int loops = NEDGES/ctx->nthreads;
-  for (word_t block = 0; block < loops; block += 1) {
-      word_t nonce = id * loops + block; 
-      if(alive.test(nonce)){
-      word_t u = dipnode(sip_keys, nonce, uorv);
+  for (u32 block = id*64; block < NEDGES; block += ctx->nthreads*64) {
+    u64 alive32 = alive.block(block);
+    for (u32 nonce = block-1; alive32; ) { // -1 compensates for 1-based ffs
+      u32 ffs = __ffsll(alive32);
+      nonce += ffs; alive32 >>= ffs;
+      u32 u = dipnode(sip_keys, nonce, uorv);
       if ((u & PART_MASK) == part) {
         if (!nonleaf.test(u >> PART_BITS)) {
           alive.reset(nonce);
         }
       }
-      }
+    }
   }
 }
 */
@@ -293,6 +357,40 @@ u32 path (cuckoo_hash & cuckoo, word_t u, word_t * us)
 		us[nu++] = u;
 	}
 	return nu - 1;
+}
+
+u64 sipblock (siphash_keys & keys, const word_t edge, u64 * buf)
+{
+	u64 v0 = keys.k0, v1 = keys.k1, v2 = keys.k2, v3 = keys.k3;
+	word_t edge0 = edge & ~EDGE_BLOCK_MASK;
+	u32 i;
+	for (i = 0; i < EDGE_BLOCK_MASK; i++)
+	{
+		word_t nonce = edge0 + i;
+		v3 ^= nonce;
+		SIPROUND;
+		SIPROUND;
+		v0 ^= nonce;
+		v2 ^= 0xff;
+		SIPROUND;
+		SIPROUND;
+		SIPROUND;
+		SIPROUND;
+		buf[i] = (v0 ^ v1) ^ (v2 ^ v3);
+	}
+	word_t nonce = edge0 + i;
+	v3 ^= nonce;
+	SIPROUND;
+	SIPROUND;
+	v0 ^= nonce;
+	v2 ^= 0xff;
+	SIPROUND;
+	SIPROUND;
+	SIPROUND;
+	SIPROUND;
+
+	buf[i] = 0;
+	return (v0 ^ v1) ^ (v2 ^ v3);
 }
 
 typedef std::pair < word_t, word_t > edge;
@@ -375,11 +473,17 @@ int main (int argc, char **argv)
 	ctx.sip_keys.k3 = k3;
 	printf("%lu, %lu, %lu, %lu\n", ctx.sip_keys.k0, ctx.sip_keys.k1, ctx.sip_keys.k2, ctx.sip_keys.k3);
 
-	unsigned long long int  *dev_hash_count, *dev_rw_count;
+	unsigned long hash_count = 0;
+	unsigned long long int*dev_hash_count;
 	cudaMalloc((void**)&dev_hash_count, sizeof(unsigned long long int));
+	int *nonce_hash_count = (int*)malloc(sizeof(int) * NEDGES/64);
+	int *dev_nonce_hash_count;
+	unsigned long long int  *dev_rw_count;
+	cudaMalloc((void**)&dev_nonce_hash_count, sizeof(int) * NEDGES/64);
 	cudaMalloc((void**)&dev_rw_count, sizeof(unsigned long long int));
+	cudaMemcpy(dev_rw_count, &hash_count, sizeof(unsigned long long int), cudaMemcpyHostToDevice);
 
-	FILE *fcount = fopen("cuckoo_lean.txt", "w");
+	FILE *fcount = fopen("cuckaroo_lean.txt", "w");
 	range = 1;
 	for (int r = 0; r < range; r++)
 	{
@@ -396,8 +500,8 @@ int main (int argc, char **argv)
 				for (u32 part = 0; part <= PART_MASK; part++)
 				{
 					checkCudaErrors (cudaMemset (ctx.nonleaf.bits, 0, nodeBytes));
-					count_node_deg <<< nthreads / tpb, tpb >>> (device_ctx, uorv, part, dev_hash_count, dev_rw_count);
-					kill_leaf_edges <<< nthreads / tpb, tpb >>> (device_ctx, uorv, part, dev_hash_count, dev_rw_count);
+					count_node_deg <<< nthreads / tpb, tpb >>> (device_ctx, uorv, part, dev_hash_count, dev_nonce_hash_count, dev_rw_count);
+					kill_leaf_edges <<< nthreads / tpb, tpb >>> (device_ctx, uorv, part, dev_hash_count, dev_nonce_hash_count, dev_rw_count);
 				}
 			}
 		}
@@ -414,97 +518,118 @@ int main (int argc, char **argv)
 		u32 cnt = 0;
 		for (int i = 0; i < NEDGES / 64; i++)
 			cnt += __builtin_popcountll (~bits[i]);
-		printf ("trim result: %u\n", cnt);
+		printf ("trim result : %u\n", cnt);
 		u32 load = (u32) (100L * cnt / CUCKOO_SIZE);
-		ulong hash_count = 0;
 		cudaMemcpy(&hash_count, dev_hash_count, sizeof(unsigned long long int), cudaMemcpyDeviceToHost);
+//		cudaMemcpy(nonce_hash_count, dev_nonce_hash_count, sizeof(int) * NEDGES/64, cudaMemcpyDeviceToHost);
 		unsigned long rw_count = 0;
 		cudaMemcpy(&rw_count, dev_rw_count, sizeof(unsigned long long int), cudaMemcpyDeviceToHost);
-		printf ("nonce %d: %d trims completed in %.3f seconds final load %d%%, hash count : %lu, rw count= %lu\n", nonce + r, trims, duration / 1000.0f, load, hash_count, rw_count);
+		printf ("nonce %d: %d trims completed in %.3f seconds final load %d%%, hash count = %lu, rw_count = %lu\n", nonce + r, trims, duration / 1000.0f, load, hash_count, rw_count);
 
+		/*FILE*fp = fopen("nonce_hash_count2.txt", "w+");
+		if(fp == NULL) return;
+		for(int i = 0; i < NEDGES/64; i++){
+			//for(int j = 0; j < 64; j++)
+			{
+			//	fprintf(fp, "%d %d\n", i*64, nonce_hash_count[i]);		
+			}
+		}
+		fclose(fp);
+		cudaFree(dev_nonce_hash_count);
+		cudaFree(dev_hash_count);
+*/
 		if (load >= 90)
 		{
 			printf ("overloaded! exiting...");
 			exit (0);
 		}
 
-		edge *trimeedges = (edge*)malloc(sizeof(edge) * cnt);
-		for(word_t block=0, i=0; block < NEDGES; block += 64){
-			u64 alive64 = ~bits[block / 64];
-			for (word_t nonce = block - 1; alive64;)
-			{					// -1 compensates for 1-based ffs
-				u32 ffs = __builtin_ffsll (alive64);
-				nonce += ffs;
-				if(ffs == 64) alive64 = 0;
-				else
-				alive64 >>= ffs;
-				word_t u0 = sipnode_ (&ctx.sip_keys, nonce, 0), v0 = sipnode_ (&ctx.sip_keys, nonce, 1);
-				edge newedge(u0,v0);
-				if(i < cnt)
-				trimeedges[i++] = newedge;
-			}
-		}
-
 		cuckoo_hash & cuckoo = *(new cuckoo_hash ());
 		word_t us[MAXPATHLEN], vs[MAXPATHLEN];
-		for (word_t i = 0; i < cnt; i++)
+
+		edge *trimeedges = (edge *) malloc (sizeof (edge) * cnt);
+		u64 buf[64];
+		for (word_t block = 0, i = 0; block < NEDGES; block += 64)
 		{
-			{					// -1 compensates for 1-based ffs
-				word_t u0 = trimeedges[i].first, v0 = trimeedges[i].second;
-				if (u0)
+			u64 alive64 = ~bits[block / 64];
+			if (!alive64)
+				continue;
+			const u64 last = sipblock (ctx.sip_keys, block, buf);
+			for (word_t nonce = block - 1; alive64;)
+			{
+				u32 ffs = __builtin_ffsll (alive64);
+				nonce += ffs;
+				if (ffs == 64) alive64 = 0;
+				else
+				alive64 >>= ffs;
+				if (nonce - block < 64)
 				{
-					u32 nu = path (cuckoo, u0, us), nv = path (cuckoo, v0, vs);
-					if (us[nu] == vs[nv])
-					{
-						u32 min = nu < nv ? nu : nv;
-						for (nu -= min, nv -= min; us[nu] != vs[nv]; nu++, nv++) ;
-						u32 len = nu + nv + 1;
-						printf ("%4d-cycle found at %d:%d%%\n", len, 0, (u32) (nonce * 100L / NEDGES));
-						if (len == PROOFSIZE)
-						{
-							printf ("Solution");
-							std::set < edge > cycle;
-							u32 n = 0;
-							cycle.insert (edge (*us, *vs));
-							while (nu--)
-								cycle.insert (edge (us[(nu + 1) & ~1], us[nu | 1]));	// u's in even position; v's in odd
-							while (nv--)
-								cycle.insert (edge (vs[nv | 1], vs[(nv + 1) & ~1]));	// u's in odd position; v's in even
-							for (word_t j=0; j < cnt; j++)
-							{
-								{	// -1 compensates for 1-based ffs
-									edge e = trimeedges[j];
-									if (cycle.find (e) != cycle.end ())
-									{
-									//	printf (" %jx", (uintmax_t) nce);
-										if (PROOFSIZE > 2)
-											cycle.erase (e);
-										n++;
-									}
-								}
-							}
-							assert (n == PROOFSIZE);
-							printf ("\n");
-						}
-					}
-					else if (nu < nv)
-					{
-						while (nu--)
-							cuckoo.set (us[nu + 1], us[nu]);
-						cuckoo.set (u0, v0);
-					}
-					else
-					{
-						while (nv--)
-							cuckoo.set (vs[nv + 1], vs[nv]);
-						cuckoo.set (v0, u0);
-					}
+					u64 one_edge = buf[nonce - block] ^ last;
+					word_t u0 = one_edge & EDGEMASK;
+					word_t v0 = (one_edge >> 32) & EDGEMASK;
+					edge newedge (u0, v0);
+					trimeedges[i++] = newedge;
 				}
 			}
 		}
+		printf("find cycle :\n");
+		for (int i = 0; i < cnt; i++)
+		{
+			word_t u0 = trimeedges[i].first;	//one_edge & EDGEMASK;
+			word_t v0 = trimeedges[i].second;	//(one_edge >> 32) & EDGEMASK;
+			if (u0)
+			{
+				u32 nu = path (cuckoo, u0, us), nv = path (cuckoo, v0, vs);
+				if (us[nu] == vs[nv])
+				{
+					u32 min = nu < nv ? nu : nv;
+					for (nu -= min, nv -= min; us[nu] != vs[nv]; nu++, nv++) ;
+					u32 len = nu + nv + 1;
+					printf ("%4d-cycle found at %d\n", len, 0);
+					if (len == PROOFSIZE)
+					{
+						printf ("Solution");
+						std::set < edge > cycle;
+						u32 n = 0;
+						cycle.insert (edge (*us, *vs));
+						while (nu--)
+							cycle.insert (edge (us[(nu + 1) & ~1], us[nu | 1]));	// u's in even position; v's in odd
+						while (nv--)
+							cycle.insert (edge (vs[nv | 1], vs[(nv + 1) & ~1]));	// u's in odd position; v's in even
+						u64 tmpbuf[64];
+						for (int j = 0; j < cnt; j++)
+						{
+							edge e = trimeedges[j];
+							if (cycle.find (e) != cycle.end ())
+							{
+								//printf(" %jx", (uintmax_t)nce);
+								if (PROOFSIZE > 2)
+									cycle.erase (e);
+								n++;
+							}
+						}
+						assert (n == PROOFSIZE);
+						printf ("\n");
+					}
+				}
+				else if (nu < nv)
+				{
+					while (nu--)
+						cuckoo.set (us[nu + 1], us[nu]);
+					cuckoo.set (u0, v0);
+				}
+				else
+				{
+					while (nv--)
+						cuckoo.set (vs[nv + 1], vs[nv]);
+					cuckoo.set (v0, u0);
+				}
+			}
+		}
+		
 		clock_t cend = clock ();
-		printf ("all time: %.4f\n", (double) (cend - cstart) / CLOCKS_PER_SEC);
-		fprintf(fcount, "%d %d %.3f %.3f\n", trims, cnt, duration/1000.0f, (double)(cend-cstart)/CLOCKS_PER_SEC - duration/1000.f);
+		printf ("all time : %.4f\n", (double) (cend - cstart) / CLOCKS_PER_SEC);
+		fprintf(fcount, "%d %d %.3f %.3f\n", trims, cnt, duration/1000.0f, (double)(cend-cstart)/CLOCKS_PER_SEC - duration/1000.0f);
 		free(trimeedges);
 		free(bits);
 	}
