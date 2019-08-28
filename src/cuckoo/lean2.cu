@@ -34,6 +34,7 @@
 #define IDXSHIFT (PART_BITS + 6)
 #endif
 
+#define EDGEBITS 30
 #define NODEBITS (EDGEBITS + 1)
 #define NNODES (2 * NEDGES)
 #define NODEMASK (NNODES-1)

@@ -7,7 +7,7 @@
 // my own cycle finding is run single threaded to avoid losing cycles
 // to race conditions (typically takes under 1% of runtime)
 
-#include "cuckaroo.h"
+#include "cuckaroo.hpp"
 #include "../crypto/siphashxN.h"
 #include <stdlib.h>
 #include <pthread.h>
@@ -21,14 +21,14 @@
 
 // algorithm/performance parameters
 
-// EDGEBITS/NEDGES/EDGEMASK defined in cuckoo.h
+// EDGEBITS/NEDGES/EDGEMASK defined in cuckaroo.h
 
 // The node bits are logically split into 3 groups:
 // XBITS 'X' bits (most significant), YBITS 'Y' bits, and ZBITS 'Z' bits (least significant)
 // Here we have the default XBITS=YBITS=7, ZBITS=15 summing to EDGEBITS=29
 // nodebits   XXXXXXX YYYYYYY ZZZZZZZZZZZZZZZ
 // bit%10     8765432 1098765 432109876543210
-// bit/10     2222222 2111111 111110000000000
+// bit/10     2222222 2211111 111110000000000
 
 // The matrix solver stores all edges in a matrix of NX * NX buckets,
 // where NX = 2^XBITS is the number of possible values of the 'X' bits.
@@ -55,34 +55,22 @@
 
 #define YBITS XBITS
 
+// need to fit 2 endpoints bucketed by one XBITS
+#define BIGSIZE0 ((2*EDGEBITS-XBITS+7)/8)
 // size in bytes of a big bucket entry
-#ifndef BIGSIZE
-#if EDGEBITS <= 15
-#define BIGSIZE 4
-// no compression needed
-#define COMPRESSROUND 0
-#else
-#define BIGSIZE 5
+// need to fit 2 endpoints bucketed by XBITS and YBITS
+#define BIGSIZE1 ((2*(EDGEBITS-XBITS)+7)/8)
 // YZ compression round; must be even
 #ifndef COMPRESSROUND
 #define COMPRESSROUND 14
 #endif
-#endif
-#endif
 // size in bytes of a small bucket entry
-#define SMALLSIZE BIGSIZE
+#define SMALLSIZE BIGSIZE1
 
-// initial entries could be smaller at percent or two slowdown
-#ifndef BIGSIZE0
-#if EDGEBITS < 30 && !defined SAVEEDGES
-#define BIGSIZE0 4
-#else
-#define BIGSIZE0 BIGSIZE
-#endif
-#endif
-// but they may need syncing entries
-#if BIGSIZE0 == 4 && EDGEBITS > 27
-#define NEEDSYNC
+#ifndef BIGSIZE
+// need to fit 2 endpoints bucketed by XBITS and YBITS
+// while able to recover some (4) Y bits from handling Ys in increasing order
+#define BIGSIZE ((2*(EDGEBITS-XBITS)-4+7)/8)
 #endif
 
 typedef uint8_t u8;
@@ -103,43 +91,42 @@ typedef u32 BIGTYPE0;
 #endif
 
 // node bits have two groups of bucketbits (X for big and Y for small) and a remaining group Z of degree bits
-const static u32 NX        = 1 << XBITS;
-const static u32 XMASK     = NX - 1;
-const static u32 NY        = 1 << YBITS;
-const static u32 YMASK     = NY - 1;
-const static u32 XYBITS    = XBITS + YBITS;
-const static u32 NXY       = 1 << XYBITS;
-const static u32 ZBITS     = EDGEBITS - XYBITS;
-const static u32 NZ        = 1 << ZBITS;
-const static u32 ZMASK     = NZ - 1;
-const static u32 YZBITS    = EDGEBITS - XBITS;
-const static u32 NYZ       = 1 << YZBITS;
-const static u32 YZMASK    = NYZ - 1;
-const static u32 YZ1BITS   = YZBITS < 16 ? YZBITS : 16;  // compressed YZ bits
-const static u32 NYZ1      = 1 << YZ1BITS;
-const static u32 YZ1MASK   = NYZ1 - 1;
-const static u32 Z1BITS    = YZ1BITS - YBITS;
-const static u32 NZ1       = 1 << Z1BITS;
-const static u32 Z1MASK    = NZ1 - 1;
-const static u32 YZ2BITS   = YZBITS < 12 ? YZBITS : 12;  // more compressed YZ bits
-const static u32 NYZ2      = 1 << YZ2BITS;
-const static u32 YZ2MASK   = NYZ2 - 1;
-const static u32 Z2BITS    = YZ2BITS - YBITS;
-const static u32 NZ2       = 1 << Z2BITS;
-const static u32 Z2MASK    = NZ2 - 1;
-const static u32 YZZBITS   = YZBITS + ZBITS;
-const static u32 YZZ1BITS  = YZ1BITS + ZBITS;
+const u32 NX        = 1 << XBITS;
+const u32 XMASK     = NX - 1;
+const u32 NY        = 1 << YBITS;
+const u32 YMASK     = NY - 1;
+const u32 XYBITS    = XBITS + YBITS;
+const u32 NXY       = 1 << XYBITS;
+const u32 ZBITS     = EDGEBITS - XYBITS;
+const u32 NZ        = 1 << ZBITS;
+const u32 ZMASK     = NZ - 1;
+const u32 YZBITS    = EDGEBITS - XBITS;
+const u32 NYZ       = 1 << YZBITS;
+const u32 YZMASK    = NYZ - 1;
+const u32 YZ1BITS   = YZBITS < 15 ? YZBITS : 15;  // compressed YZ bits
+const u32 NYZ1      = 1 << YZ1BITS;
+const u32 MAXNZNYZ1 = NZ < NYZ1 ? NYZ1 : NZ;
+const u32 YZ1MASK   = NYZ1 - 1;
+const u32 Z1BITS    = YZ1BITS - YBITS;
+const u32 NZ1       = 1 << Z1BITS;
+const u32 Z1MASK    = NZ1 - 1;
+const u32 YZ2BITS   = YZBITS < 11 ? YZBITS : 11;  // more compressed YZ bits
+const u32 NYZ2      = 1 << YZ2BITS;
+const u32 YZ2MASK   = NYZ2 - 1;
+const u32 Z2BITS    = YZ2BITS - YBITS;
+const u32 NZ2       = 1 << Z2BITS;
+const u32 Z2MASK    = NZ2 - 1;
+const u32 YZZBITS   = YZBITS + ZBITS;
+const u32 YZZ1BITS  = YZ1BITS + ZBITS;
 
-const static u32 MAXEDGES = NX * NYZ2;
+const u32 MAXEDGES = NX * NYZ2;
 
-const static u32 BIGSLOTBITS   = BIGSIZE * 8;
-const static u32 SMALLSLOTBITS = SMALLSIZE * 8;
-const static u64 BIGSLOTMASK   = (1ULL << BIGSLOTBITS) - 1ULL;
-const static u64 SMALLSLOTMASK = (1ULL << SMALLSLOTBITS) - 1ULL;
-const static u32 BIGSLOTBITS0  = BIGSIZE0 * 8;
-const static u64 BIGSLOTMASK0  = (1ULL << BIGSLOTBITS0) - 1ULL;
-const static u32 NONYZBITS     = BIGSLOTBITS0 - YZBITS;
-const static u32 NNONYZ        = 1 << NONYZBITS;
+const u32 BIGSLOTBITS   = BIGSIZE * 8;
+const u32 SMALLSLOTBITS = SMALLSIZE * 8;
+const u64 BIGSLOTMASK   = (1ULL << BIGSLOTBITS) - 1ULL;
+const u64 SMALLSLOTMASK = (1ULL << SMALLSLOTBITS) - 1ULL;
+const u32 BIGSLOTBITS0  = BIGSIZE0 * 8;
+const u64 BIGSLOTMASK0  = (1ULL << BIGSLOTBITS0) - 1ULL;
 
 // for p close to 0, Pr(X>=k) < e^{-n*p*eps^2} where k=n*p*(1+eps)
 // see https://en.wikipedia.org/wiki/Binomial_distribution#Tail_bounds
@@ -157,35 +144,25 @@ const static u32 NNONYZ        = 1 << NONYZBITS;
 #define TRIMFRAC256 176
 #endif
 
-const static u32 NTRIMMEDZ  = NZ * TRIMFRAC256 / 256;
+const u32 NTRIMMEDZ  = NZ * TRIMFRAC256 / 256;
 
-const static u32 ZBUCKETSLOTS = NZ + NZ * BIGEPS;
-#ifdef SAVEEDGES
-const static u32 ZBUCKETSIZE = NTRIMMEDZ * (BIGSIZE + sizeof(u32));  // assumes EDGEBITS <= 32
-#else
-const static u32 ZBUCKETSIZE = ZBUCKETSLOTS * BIGSIZE0; 
-#endif
-const static u32 TBUCKETSIZE = ZBUCKETSLOTS * BIGSIZE; 
+const u32 ZBUCKETSLOTS = NZ + NZ * BIGEPS;
+const u32 ZBUCKETSIZE = ZBUCKETSLOTS * BIGSIZE0;
+const u32 TBUCKETSIZE = ZBUCKETSLOTS * BIGSIZE1;
 
 template<u32 BUCKETSIZE>
 struct zbucket {
   u32 size;
-  const static u32 RENAMESIZE = NZ2 + (COMPRESSROUND ? NZ1 : 0);
+  // should avoid different values of RENAMESIZE in different threads of one process
+  static const u32 RENAMESIZE = 2*NZ2 + 2*(COMPRESSROUND ? NZ1 : 0);
   union alignas(16) {
     u8 bytes[BUCKETSIZE];
     struct {
-#ifdef SAVEEDGES
-      u32 words[BUCKETSIZE/sizeof(u32) - RENAMESIZE - NTRIMMEDZ];
-#else
       u32 words[BUCKETSIZE/sizeof(u32) - RENAMESIZE];
-#endif
-      u32 renameu1[NZ2/2];
-      u32 renamev1[NZ2/2];
-      u32 renameu[COMPRESSROUND ? NZ1/2 : 0];
-      u32 renamev[COMPRESSROUND ? NZ1/2 : 0];
-#ifdef SAVEEDGES
-      u32 edges[NTRIMMEDZ];
-#endif
+      u32 renameu1[NZ2];
+      u32 renamev1[NZ2];
+      u32 renameu[COMPRESSROUND ? NZ1 : 0];
+      u32 renamev[COMPRESSROUND ? NZ1 : 0];
     };
   };
   u32 setsize(u8 const *end) {
@@ -241,7 +218,7 @@ typedef struct {
   edgetrimmer *et;
 } thread_ctx;
 
-typedef u8 zbucket8[NYZ1];
+typedef u8 zbucket8[2*MAXNZNYZ1];
 typedef u16 zbucket16[NTRIMMEDZ];
 typedef u32 zbucket32[NTRIMMEDZ];
 
@@ -251,8 +228,6 @@ public:
   siphash_keys sip_keys;
   yzbucket<ZBUCKETSIZE> *buckets;
   yzbucket<TBUCKETSIZE> *tbuckets;
-  zbucket32 *tedges;
-  zbucket16 *tzs;
   zbucket8 *tdegs;
   offset_t *tcounts;
   u32 ntrims;
@@ -260,21 +235,6 @@ public:
   bool showall;
   thread_ctx *threads;
   trim_barrier barry;
-
-#if NSIPHASH > 4
-
-  void* operator new(size_t size) noexcept {
-    void* newobj;
-    int tmp = posix_memalign(&newobj, NSIPHASH * sizeof(u32), sizeof(edgetrimmer));
-
-    if (tmp != 0) {
-      return nullptr;
-    }
-
-    return newobj;
-  }
-
-#endif
 
   void touch(u8 *p, const offset_t n) {
     for (offset_t i=0; i<n; i+=4096)
@@ -290,13 +250,7 @@ public:
     touch((u8 *)buckets, sizeof(matrix<ZBUCKETSIZE>));
     tbuckets = new yzbucket<TBUCKETSIZE>[nthreads];
     touch((u8 *)tbuckets, sizeof(yzbucket<TBUCKETSIZE>[nthreads]));
-#ifdef SAVEEDGES
-    tedges  = 0;
-#else
-    tedges  = new zbucket32[nthreads];
-#endif
     tdegs   = new zbucket8[nthreads];
-    tzs     = new zbucket16[nthreads];
     tcounts = new offset_t[nthreads];
     threads = new thread_ctx[nthreads];
   }
@@ -304,9 +258,7 @@ public:
     delete[] threads;
     delete[] buckets;
     delete[] tbuckets;
-    delete[] tedges;
     delete[] tdegs;
-    delete[] tzs;
     delete[] tcounts;
   }
   offset_t count() const {
@@ -316,53 +268,37 @@ public:
     return cnt;
   }
 
-  void genUnodes(const u32 id) {
+  void genUVnodes(const u32 id) {
     u64 rdtsc0, rdtsc1;
-#ifdef NEEDSYNC
-    u32 last[NX];;
-#endif
     const u32 NEBS = NSIPHASH * EDGE_BLOCK_SIZE;
-    u64 buf[NEBS];
-  
+    alignas(NSIPHASH > 4 ? 4*NSIPHASH : 8) u64 buf[NEBS];
+
     rdtsc0 = __rdtsc();
     u8 const *base = (u8 *)buckets;
     indexer<ZBUCKETSIZE> dst;
     const u32 starty = NY *  id    / nthreads;
     const u32   endy = NY * (id+1) / nthreads;
     u32 edge0 = starty << YZBITS, endedge0 = edge0 + NYZ;
-    const u64 e1 = edge0;
-#if NSIPHASH == 4
-    __m128i v0, v1, v2, v3, v4, v5, v6, v7;
-    __m128i vpacket0 = _mm_set_epi64x(e1+EDGE_BLOCK_SIZE, e1+0);
-    __m128i vpacket1 = _mm_set_epi64x(e1+3*EDGE_BLOCK_SIZE, e1+2*EDGE_BLOCK_SIZE);
-    static const __m128i vpacketinc = {NEBS, NEBS};
-#elif NSIPHASH == 8
-    const __m256i vinit = _mm256_load_si256((__m256i *)&sip_keys);
-    __m256i v0, v1, v2, v3, v4, v5, v6, v7;
-    __m256i vpacket0 = _mm256_set_epi64x(e1+3*EDGE_BLOCK_SIZE, e1+2*EDGE_BLOCK_SIZE, e1+EDGE_BLOCK_SIZE, e1+0);
-    __m256i vpacket1 = _mm256_set_epi64x(e1+7*EDGE_BLOCK_SIZE, e1+6*EDGE_BLOCK_SIZE, e1+5*EDGE_BLOCK_SIZE, e1+4*EDGE_BLOCK_SIZE);
-    static const __m256i vpacketinc = {NEBS, NEBS, NEBS, NEBS};
-#endif
     offset_t sumsize = 0;
     for (u32 my = starty; my < endy; my++, endedge0 += NYZ) {
-      barrier();
       dst.matrixv(my);
-#ifdef NEEDSYNC
-      for (u32 x=0; x < NX; x++)
-        last[x] = edge0;
-#endif
       for (; edge0 < endedge0; edge0 += NEBS) {
 #if NSIPHASH == 1
-        siphash_state shs(keys);
-        for (e = 0; e < NEBS; e += NSIPHASH) {
+        siphash_state shs(sip_keys);
+        for (u32 e = 0; e < NEBS; e += NSIPHASH) {
           shs.hash24(edge0 + e);
           buf[e] = shs.xor_lanes();
         }
 #elif NSIPHASH == 4
+        const u64 e1 = edge0;
+        const __m128i vpacketinc = _mm_set1_epi64x(1);
+        __m128i v0, v1, v2, v3, v4, v5, v6, v7;
         v7 = v3 = _mm_set1_epi64x(sip_keys.k3);
         v4 = v0 = _mm_set1_epi64x(sip_keys.k0);
         v5 = v1 = _mm_set1_epi64x(sip_keys.k1);
         v6 = v2 = _mm_set1_epi64x(sip_keys.k2);
+        __m128i vpacket0 = _mm_set_epi64x(e1+EDGE_BLOCK_SIZE, e1+0);
+        __m128i vpacket1 = _mm_set_epi64x(e1+3*EDGE_BLOCK_SIZE, e1+2*EDGE_BLOCK_SIZE);
         for (u32 e = 0; e < NEBS; e += NSIPHASH) {
           v3 = XOR(v3,vpacket0); v7 = XOR(v7,vpacket1);
           SIPROUNDX2N; SIPROUNDX2N;
@@ -376,10 +312,16 @@ public:
           _mm_store_si128((__m128i *)(buf + e + 2), XOR(XOR(v4,v5),XOR(v6,v7)));
         }
 #elif NSIPHASH == 8
+        const u64 e1 = edge0;
+        const __m256i vinit = _mm256_load_si256((__m256i *)&sip_keys);
+        const __m256i vpacketinc = _mm256_set1_epi64x(1);
+        __m256i v0, v1, v2, v3, v4, v5, v6, v7;
         v7 = v3 = _mm256_permute4x64_epi64(vinit, 0xFF);
         v4 = v0 = _mm256_permute4x64_epi64(vinit, 0x00);
         v5 = v1 = _mm256_permute4x64_epi64(vinit, 0x55);
         v6 = v2 = _mm256_permute4x64_epi64(vinit, 0xAA);
+        __m256i vpacket0 = _mm256_set_epi64x(e1+3*EDGE_BLOCK_SIZE, e1+2*EDGE_BLOCK_SIZE, e1+EDGE_BLOCK_SIZE, e1+0);
+        __m256i vpacket1 = _mm256_set_epi64x(e1+7*EDGE_BLOCK_SIZE, e1+6*EDGE_BLOCK_SIZE, e1+5*EDGE_BLOCK_SIZE, e1+4*EDGE_BLOCK_SIZE);
         for (u32 e = 0; e < NEBS; e += NSIPHASH) {
           v3 = XOR(v3,vpacket0); v7 = XOR(v7,vpacket1);
           SIPROUNDX2N; SIPROUNDX2N;
@@ -393,66 +335,33 @@ public:
           _mm256_store_si256((__m256i *)(buf + e + 4), XOR(XOR(v4,v5),XOR(v6,v7)));
         }
 #endif
-        const u64 buflast = buf[EDGE_BLOCK_MASK];
-        for (u32 e = 0; e < NEBS; e++) {
-// bit        28..21     20..13    12..0
-// node       XXXXXX     YYYYYY    ZZZZZ
-          const u32 nodes = buf[e] ^ buflast;
-          const u32 node0 = nodes & EDGEMASK;
-          const u32 node1 = (nodes >> 32) & EDGEMASK;
-          const u32 ux = node0 >> YZBITS;
-          const BIGTYPE0 zz = (BIGTYPE0)node1 << YZBITS | (node & YZMASK);
-#ifndef NEEDSYNC
-// bit        39..21     20..13    12..0
-// write        edge     YYYYYY    ZZZZZ
-          *(BIGTYPE0 *)(base+dst.index[ux]) = zz;
-          dst.index[ux] += BIGSIZE0;
-#else
-          if (zz) {
-            for (; unlikely(last[ux] + NNONYZ <= edge); last[ux] += NNONYZ, dst.index[ux] += BIGSIZE0)
-              *(u32 *)(base+dst.index[ux]) = 0;
-            *(u32 *)(base+dst.index[ux]) = zz;
+        for (u32 ns = 0; ns < NSIPHASH; ns++) {
+          const u64 buflast = buf[NEBS - NSIPHASH + ns];
+          buf[NEBS - NSIPHASH + ns] = 0;
+          for (u32 e = 0; e < NEBS; e += NSIPHASH) {
+            const u64 nodes = buf[e + ns] ^ buflast;
+            const u32 node0 = nodes & EDGEMASK;
+            const u32 node1 = (nodes >> 32) & EDGEMASK;
+            const u32 ux = node0 >> YZBITS;
+// bit        50...22     21..15    14..0
+// write      VXXYYZZ     UYYYYY    UZZZZ
+            *(BIGTYPE0 *)(base+dst.index[ux]) = (BIGTYPE0)node1 << YZBITS | (node0 & YZMASK);
             dst.index[ux] += BIGSIZE0;
-            last[ux] = edge;
           }
-#endif
         }
       }
-#ifdef NEEDSYNC
-      for (u32 ux=0; ux < NX; ux++) {
-        for (; last[ux]<endedge-NNONYZ; last[ux]+=NNONYZ) {
-          *(u32 *)(base+dst.index[ux]) = 0;
-          dst.index[ux] += BIGSIZE0;
-        }
-      }
-#endif
       sumsize += dst.storev(buckets, my);
     }
     rdtsc1 = __rdtsc();
-    if (!id) print_log("genUnodes round %2d size %u rdtsc: %lu\n", uorv, sumsize/BIGSIZE0, rdtsc1-rdtsc0);
+    if (!id) print_log("genUVnodes size %u rdtsc: %lu\n", sumsize/BIGSIZE0, rdtsc1-rdtsc0);
     tcounts[id] = sumsize/BIGSIZE0;
   }
 
-  void genVnodes(const u32 id, const u32 uorv) {
+  void sortVnodes(const u32 id, const u32 uorv) {
     u64 rdtsc0, rdtsc1;
-#if NSIPHASH == 4
-    static const __m128i vxmask = {XMASK, XMASK};
-    static const __m128i vyzmask = {YZMASK, YZMASK};
-    const __m128i ff = _mm_set1_epi64x(0xffLL);
-    __m128i v0, v1, v2, v3, v4, v5, v6, v7;
-    __m128i vpacket0, vpacket1, vhi0, vhi1;
-#elif NSIPHASH == 8
-    static const __m256i vxmask = {XMASK, XMASK, XMASK, XMASK};
-    static const __m256i vyzmask = {YZMASK, YZMASK, YZMASK, YZMASK};
-    const __m256i vinit = _mm256_load_si256((__m256i *)&sip_keys);
-    __m256i vpacket0, vpacket1, vhi0, vhi1;
-    __m256i v0, v1, v2, v3, v4, v5, v6, v7;
-#endif
-    static const u32 NONDEGBITS = std::min(BIGSLOTBITS, 2 * YZBITS) - ZBITS;
-    static const u32 NONDEGMASK = (1 << NONDEGBITS) - 1;
     indexer<ZBUCKETSIZE> dst;
     indexer<TBUCKETSIZE> small;
-  
+
     rdtsc0 = __rdtsc();
     offset_t sumsize = 0;
     u8 const *base = (u8 *)buckets;
@@ -460,158 +369,54 @@ public:
     const u32 startux = NX *  id    / nthreads;
     const u32   endux = NX * (id+1) / nthreads;
     for (u32 ux = startux; ux < endux; ux++) { // matrix x == ux
-      barrier();
       small.matrixu(0);
       for (u32 my = 0 ; my < NY; my++) {
-        u32 edge = my << YZBITS;
         u8    *readbig = buckets[ux][my].bytes;
         u8 const *endreadbig = readbig + buckets[ux][my].size;
 // print_log("id %d x %d y %d size %u read %d\n", id, ux, my, buckets[ux][my].size, readbig-base);
         for (; readbig < endreadbig; readbig += BIGSIZE0) {
-// bit     39/31..21     20..13    12..0
-// read         edge     UYYYYY    UZZZZ   within UX partition
+// bit        50...22     21..15    14..0
+// write      VXXYYZZ     UYYYYY    UZZZZ   within UX partition
           BIGTYPE0 e = *(BIGTYPE0 *)readbig;
-#if BIGSIZE0 > 4
           e &= BIGSLOTMASK0;
-#elif defined NEEDSYNC
-          if (unlikely(!e)) { edge += NNONYZ; continue; }
-#endif
-          edge += ((u32)(e >> YZBITS) - edge) & (NNONYZ-1);
-// if (ux==78 && my==243) print_log("id %d ux %d my %d e %08x prefedge %x edge %x\n", id, ux, my, e, e >> YZBITS, edge);
+          u32 vxyz = e >> YZBITS;
           const u32 uy = (e >> ZBITS) & YMASK;
-// bit         39..13     12..0
-// write         edge     UZZZZ   within UX UY partition
-          *(u64 *)(small0+small.index[uy]) = ((u64)edge << ZBITS) | (e & ZMASK);
+// bit         43...15     14..0
+// write       VXXYYZZ     UZZZZ   within UX UY partition
+          *(u64 *)(small0+small.index[uy]) = ((u64)vxyz << ZBITS) | (e & ZMASK);
 // print_log("id %d ux %d y %d e %010lx e' %010x\n", id, ux, my, e, ((u64)edge << ZBITS) | (e >> YBITS));
           small.index[uy] += SMALLSIZE;
         }
-        if (unlikely(edge >> NONYZBITS != (((my+1) << YZBITS) - 1) >> NONYZBITS))
-        { print_log("OOPS1: id %d ux %d y %d edge %x vs %x\n", id, ux, my, edge, ((my+1)<<YZBITS)-1); exit(0); }
       }
       u8 *degs = tdegs[id];
       small.storeu(tbuckets+id, 0);
       dst.matrixu(ux);
       for (u32 uy = 0 ; uy < NY; uy++) {
-        memset(degs, 0, NZ);
+        assert(NZ <= sizeof(zbucket8));
+        memset(degs, 0xff, NZ);
         u8 *readsmall = tbuckets[id][uy].bytes, *endreadsmall = readsmall + tbuckets[id][uy].size;
-// if (id==1) print_log("id %d ux %d y %d size %u sumsize %u\n", id, ux, uy, tbuckets[id][uy].size/BIGSIZE, sumsize);
+// if (id==1) print_log("id %d ux %d y %d size %u sumsize %u\n", id, ux, uy, tbuckets[id][uy].size/BIGSIZE1, sumsize);
         for (u8 *rdsmall = readsmall; rdsmall < endreadsmall; rdsmall+=SMALLSIZE)
-          degs[*(u32 *)rdsmall & ZMASK] = 1;
-        u16 *zs = tzs[id];
-#ifdef SAVEEDGES
-        u32 *edges0 = buckets[ux][uy].edges;
-#else
-        u32 *edges0 = tedges[id];
-#endif
-        u32 *edges = edges0, edge = 0;
+          degs[*(u32 *)rdsmall & ZMASK]++;
+
+        u64 uy37 = (int64_t)uy << YZZBITS;
         for (u8 *rdsmall = readsmall; rdsmall < endreadsmall; rdsmall+=SMALLSIZE) {
-// bit         39..13     12..0
-// read          edge     UZZZZ    sorted by UY within UX partition
+// bit         43...15     14..0
+// write       VXXYYZZ     UZZZZ   within UX UY partition
           const u64 e = *(u64 *)rdsmall;
-          edge += ((e >> ZBITS) - edge) & NONDEGMASK;
-// if (id==0) print_log("id %d ux %d uy %d e %010lx pref %4x edge %x mask %x\n", id, ux, uy, e, e>>ZBITS, edge, NONDEGMASK);
-          *edges = edge;
-          const u32 z = e & ZMASK;
-          *zs = z;
-          const u32 delta = degs[z ^ 1];
-          edges += delta;
-          zs    += delta;
-        }
-        if (unlikely(edge >> NONDEGBITS != EDGEMASK >> NONDEGBITS))
-        { print_log("OOPS2: id %d ux %d uy %d edge %x vs %x\n", id, ux, uy, edge, EDGEMASK); exit(0); }
-        assert(edges - edges0 < NTRIMMEDZ);
-        const u16 *readz = tzs[id];
-        const u32 *readedge = edges0;
-        int64_t uy34 = (int64_t)uy << YZZBITS;
-#if NSIPHASH == 4
-        const __m128i vuy34 = _mm_set1_epi64x(uy34);
-        const __m128i vuorv = _mm_set1_epi64x(uorv);
-        for (; readedge <= edges-NSIPHASH; readedge += NSIPHASH, readz += NSIPHASH) {
-          v4 = v0 = _mm_set1_epi64x(sip_keys.k0);
-          v5 = v1 = _mm_set1_epi64x(sip_keys.k1);
-          v6 = v2 = _mm_set1_epi64x(sip_keys.k2);
-          v7 = v3 = _mm_set1_epi64x(sip_keys.k3);
-
-          vpacket0 = _mm_slli_epi64(_mm_cvtepu32_epi64(*(__m128i*) readedge     ), 1) | vuorv;
-          vhi0     = vuy34 | _mm_slli_epi64(_mm_cvtepu16_epi64(_mm_set_epi64x(0,*(u64*)readz)), YZBITS);
-          vpacket1 = _mm_slli_epi64(_mm_cvtepu32_epi64(*(__m128i*)(readedge + 2)), 1) | vuorv;
-          vhi1     = vuy34 | _mm_slli_epi64(_mm_cvtepu16_epi64(_mm_set_epi64x(0,*(u64*)(readz + 2))), YZBITS);
-
-          v3 = XOR(v3,vpacket0); v7 = XOR(v7,vpacket1);
-          SIPROUNDX2N; SIPROUNDX2N;
-          v0 = XOR(v0,vpacket0); v4 = XOR(v4,vpacket1);
-          v2 = XOR(v2,ff);
-          v6 = XOR(v6,ff);
-          SIPROUNDX2N; SIPROUNDX2N; SIPROUNDX2N; SIPROUNDX2N;
-          v0 = XOR(XOR(v0,v1),XOR(v2,v3));
-          v4 = XOR(XOR(v4,v5),XOR(v6,v7));
-
-          v1 = _mm_srli_epi64(v0, YZBITS) & vxmask;
-          v5 = _mm_srli_epi64(v4, YZBITS) & vxmask;
-          v0 = vhi0 | (v0 & vyzmask);
-          v4 = vhi1 | (v4 & vyzmask);
-
-          u32 vx;
-#define STORE(i,v,x,w) \
-  vx = extract32(v,x);\
-  *(u64 *)(base+dst.index[vx]) = _mm_extract_epi64(w,i%2);\
-  dst.index[vx] += BIGSIZE;
-          STORE(0,v1,0,v0); STORE(1,v1,2,v0);
-          STORE(2,v5,0,v4); STORE(3,v5,2,v4);
-        }
-#elif NSIPHASH == 8
-        const __m256i vuy34  = {uy34, uy34, uy34, uy34};
-        const __m256i vuorv  = {uorv, uorv, uorv, uorv};
-        for (; readedge <= edges-NSIPHASH; readedge += NSIPHASH, readz += NSIPHASH) {
-          v7 = v3 = _mm256_permute4x64_epi64(vinit, 0xFF);
-          v4 = v0 = _mm256_permute4x64_epi64(vinit, 0x00);
-          v5 = v1 = _mm256_permute4x64_epi64(vinit, 0x55);
-          v6 = v2 = _mm256_permute4x64_epi64(vinit, 0xAA);
-
-          vpacket0 = _mm256_slli_epi64(_mm256_cvtepu32_epi64(*(__m128i*) readedge     ), 1) | vuorv;
-          vhi0     = vuy34 | _mm256_slli_epi64(_mm256_cvtepu16_epi64(_mm_set_epi64x(0,*(u64*)readz)), YZBITS);
-          vpacket1 = _mm256_slli_epi64(_mm256_cvtepu32_epi64(*(__m128i*)(readedge + 4)), 1) | vuorv;
-          vhi1     = vuy34 | _mm256_slli_epi64(_mm256_cvtepu16_epi64(_mm_set_epi64x(0,*(u64*)(readz + 4))), YZBITS);
-
-          v3 = XOR(v3,vpacket0); v7 = XOR(v7,vpacket1);
-          SIPROUNDX2N; SIPROUNDX2N;
-          v0 = XOR(v0,vpacket0); v4 = XOR(v4,vpacket1);
-          v2 = XOR(v2,_mm256_set1_epi64x(0xffLL));
-          v6 = XOR(v6,_mm256_set1_epi64x(0xffLL));
-          SIPROUNDX2N; SIPROUNDX2N; SIPROUNDX2N; SIPROUNDX2N;
-          v0 = XOR(XOR(v0,v1),XOR(v2,v3));
-          v4 = XOR(XOR(v4,v5),XOR(v6,v7));
-    
-          v1 = _mm256_srli_epi64(v0, YZBITS) & vxmask;
-          v5 = _mm256_srli_epi64(v4, YZBITS) & vxmask;
-          v0 = vhi0 | (v0 & vyzmask);
-          v4 = vhi1 | (v4 & vyzmask);
-
-          u32 vx;
-#define STORE(i,v,x,w) \
-  vx = _mm256_extract_epi32(v,x);\
-  *(u64 *)(base+dst.index[vx]) = _mm256_extract_epi64(w,i%4);\
-  dst.index[vx] += BIGSIZE;
-// print_log("Id %d ux %d y %d edge %08x e' %010lx vx %d\n", id, ux, uy, readedge[i], _mm256_extract_epi64(w,i%4), vx);
-
-          STORE(0,v1,0,v0); STORE(1,v1,2,v0); STORE(2,v1,4,v0); STORE(3,v1,6,v0);
-          STORE(4,v5,0,v4); STORE(5,v5,2,v4); STORE(6,v5,4,v4); STORE(7,v5,6,v4);
-        }
-#endif
-        for (; readedge < edges; readedge++, readz++) { // process up to 7 leftover edges if NSIPHASH==8
-          const u32 node = sipnode(&sip_keys, *readedge, uorv);
-          const u32 vx = node >> YZBITS; // & XMASK;
-// bit        39..34    33..21     20..13     12..0
-// write      UYYYYY    UZZZZZ     VYYYYY     VZZZZ   within VX partition
-          *(u64 *)(base+dst.index[vx]) = uy34 | ((u64)*readz << YZBITS) | (node & YZMASK);
+	  const u32 vx = (e >> YZZBITS) & XMASK;
+	  const u32 uz = e & ZMASK;
+// bit     43/39..37    36..22     21..15     14..0
+// write      UYYYYY    UZZZZZ     VYYYYY     VZZZZ   within UX VX partition
+          *(u64 *)(base+dst.index[vx]) = uy37 | ((u64)uz << YZBITS) | ((e >> ZBITS) & YZMASK);
 // print_log("id %d ux %d y %d edge %08x e' %010lx vx %d\n", id, ux, uy, *readedge, uy34 | ((u64)(node & YZMASK) << ZBITS) | *readz, vx);
-          dst.index[vx] += BIGSIZE;
+          dst.index[vx] += degs[uz] ? BIGSIZE : 0;
         }
       }
       sumsize += dst.storeu(buckets, ux);
     }
     rdtsc1 = __rdtsc();
-    if (!id) print_log("genVnodes round %2d size %u rdtsc: %lu\n", uorv, sumsize/BIGSIZE, rdtsc1-rdtsc0);
+    if (!id) print_log("sortVnodes round %2d size %u rdtsc: %lu\n", uorv, sumsize/BIGSIZE, rdtsc1-rdtsc0);
     tcounts[id] = sumsize/BIGSIZE;
   }
 
@@ -628,7 +433,7 @@ public:
     u64 rdtsc0, rdtsc1;
     indexer<ZBUCKETSIZE> dst;
     indexer<TBUCKETSIZE> small;
-  
+
     rdtsc0 = __rdtsc();
     offset_t sumsize = 0;
     u8 const *base = (u8 *)buckets;
@@ -636,7 +441,6 @@ public:
     const u32 startvx = NY *  id    / nthreads;
     const u32   endvx = NY * (id+1) / nthreads;
     for (u32 vx = startvx; vx < endvx; vx++) {
-      barrier();
       small.matrixu(0);
       for (u32 ux = 0 ; ux < NX; ux++) {
         u32 uxyz = ux << YZBITS;
@@ -664,11 +468,11 @@ public:
       TRIMONV ? dst.matrixv(vx) : dst.matrixu(vx);
       for (u32 vy = 0 ; vy < NY; vy++) {
         const u64 vy34 = (u64)vy << YZZBITS;
-        memset(degs, 0, NZ);
+        memset(degs, 0xff, NZ);
         u8    *readsmall = tbuckets[id][vy].bytes, *endreadsmall = readsmall + tbuckets[id][vy].size;
-// print_log("id %d vx %d vy %d size %u sumsize %u\n", id, vx, vy, tbuckets[id][vx].size/BIGSIZE, sumsize);
+// print_log("id %d vx %d vy %d size %u sumsize %u\n", id, vx, vy, tbuckets[id][vx].size/BIGSIZE1, sumsize);
         for (u8 *rdsmall = readsmall; rdsmall < endreadsmall; rdsmall += DSTSIZE)
-          degs[*(u32 *)rdsmall & ZMASK] = DSTSIZE;
+          degs[*(u32 *)rdsmall & ZMASK]++;
         u32 ux = 0;
         for (u8 *rdsmall = readsmall; rdsmall < endreadsmall; rdsmall += DSTSIZE) {
 // bit        39..37    36..30     29..15     14..0      with XBITS==YBITS==7
@@ -679,10 +483,10 @@ public:
 // bit    41/39..34    33..21     20..13     12..0
 // write     VYYYYY    VZZZZZ     UYYYYY     UZZZZ   within UX partition
           *(u64 *)(base+dst.index[ux]) = vy34 | ((e & ZMASK) << YZBITS) | ((e >> ZBITS) & YZMASK);
-          dst.index[ux] += degs[(e & ZMASK) ^ 1];
+          dst.index[ux] += degs[e & ZMASK] ? DSTSIZE : 0;
         }
         if (unlikely(ux >> DSTPREFBITS != XMASK >> DSTPREFBITS))
-        { print_log("OOPS4: id %d vx %x ux %x vs %x\n", id, vx, ux, XMASK); }
+        { print_log("OOPS4: id %d vx %x ux %x vs %x\n", id, vx, ux, XMASK); exit(1); }
       }
       sumsize += TRIMONV ? dst.storev(buckets, vx) : dst.storeu(buckets, vx);
     }
@@ -704,7 +508,7 @@ public:
     indexer<ZBUCKETSIZE> dst;
     indexer<TBUCKETSIZE> small;
     u32 maxnnid = 0;
-  
+
     rdtsc0 = __rdtsc();
     offset_t sumsize = 0;
     u8 const *base = (u8 *)buckets;
@@ -712,6 +516,7 @@ public:
     const u32 startvx = NY *  id    / nthreads;
     const u32   endvx = NY * (id+1) / nthreads;
     for (u32 vx = startvx; vx < endvx; vx++) {
+      barrier();
       small.matrixu(0);
       for (u32 ux = 0 ; ux < NX; ux++) {
         u32 uyz = 0;
@@ -740,18 +545,19 @@ public:
           small.index[vy] += SRCSIZE;
         }
       }
-      u8 *degs = tdegs[id];
+      u16 *degs = (u16 *)tdegs[id];
       small.storeu(tbuckets+id, 0);
       TRIMONV ? dst.matrixv(vx) : dst.matrixu(vx);
       u32 newnodeid = 0;
       u32 *renames = TRIMONV ? buckets[0][vx].renamev : buckets[vx][0].renameu;
-      u32 *endrenames = renames + NZ1/2;
+      u32 *endrenames = renames + NZ1;
       for (u32 vy = 0 ; vy < NY; vy++) {
-        memset(degs, 0, NZ);
+        assert(2*NZ <= sizeof(zbucket8));
+        memset(degs, 0xff, 2 * NZ); // sets each u16 entry to 0xffff
         u8    *readsmall = tbuckets[id][vy].bytes, *endreadsmall = readsmall + tbuckets[id][vy].size;
-// print_log("id %d vx %d vy %d size %u sumsize %u\n", id, vx, vy, tbuckets[id][vx].size/BIGSIZE, sumsize);
+// print_log("id %d vx %d vy %d size %u sumsize %u\n", id, vx, vy, tbuckets[id][vx].size/BIGSIZE1, sumsize);
         for (u8 *rdsmall = readsmall; rdsmall < endreadsmall; rdsmall += SRCSIZE)
-          degs[*(u32 *)rdsmall & ZMASK] = 1;
+          degs[*(u32 *)rdsmall & ZMASK]++;
         u32 ux = 0;
         u32 nrenames = 0;
         for (u8 *rdsmall = readsmall; rdsmall < endreadsmall; rdsmall += SRCSIZE) {
@@ -764,28 +570,26 @@ public:
             ux += ((u32)(e >> YZZBITS) - ux) & SRCPREFMASK2;
           else ux = e >> YZZ1BITS;
           const u32 vz = e & ZMASK;
-          u16 *pdeg = (u16 *)degs + (vz >> 1);
-          u16 vdeg = *pdeg;
-          if (vdeg >= 0x0101) {
-            if (vdeg == 0x0101) {
-              *pdeg = vdeg = 0x0102 + nrenames++;
-              *renames++ = vy << ZBITS | (vz & ~1);  // neutralize parity, to be restored upon use
+          u16 vdeg = degs[vz];
+          if (vdeg) {
+            if (vdeg < 32) {
+              degs[vz] = vdeg = 32 + nrenames++;
+              *renames++ = vy << ZBITS | vz;
               if (renames == endrenames) {
                 endrenames += (TRIMONV ? sizeof(yzbucket<ZBUCKETSIZE>) : sizeof(zbucket<ZBUCKETSIZE>)) / sizeof(u32);
-                renames = endrenames - NZ1/2;
+                renames = endrenames - NZ1;
               }
             }
-            vdeg = ((vdeg-0x0102) << 1) | (vz & 1); // preserve parity
 // bit       37..22     21..15     14..0
 // write     VYYZZ'     UYYYYY     UZZZZ   within UX partition  if TRIMONV
             if (TRIMONV)
-                 *(u64 *)(base+dst.index[ux]) = ((u64)(newnodeid + vdeg) << YZBITS ) | ((e >> ZBITS) & YZMASK);
-            else *(u32 *)(base+dst.index[ux]) = (     (newnodeid + vdeg) << YZ1BITS) | ((e >> ZBITS) & YZ1MASK);
+                 *(u64 *)(base+dst.index[ux]) = ((u64)(newnodeid + vdeg-32) << YZBITS ) | ((e >> ZBITS) & YZMASK);
+            else *(u32 *)(base+dst.index[ux]) = (     (newnodeid + vdeg-32) << YZ1BITS) | ((e >> ZBITS) & YZ1MASK);
 // if (vx==44&&vy==58) print_log("  id %d vx %d vy %d newe %010lx\n", id, vx, vy, vy28 | ((vdeg) << YZBITS) | ((e >> ZBITS) & YZMASK));
             dst.index[ux] += DSTSIZE;
           }
         }
-        newnodeid += 2 * nrenames;
+        newnodeid += nrenames;
         if (TRIMONV && unlikely(ux >> SRCPREFBITS2 != XMASK >> SRCPREFBITS2))
         { print_log("OOPS6: id %d vx %d vy %d ux %x vs %x\n", id, vx, vy, ux, XMASK); exit(0); }
       }
@@ -804,7 +608,7 @@ public:
   void trimedges1(const u32 id, const u32 round) {
     u64 rdtsc0, rdtsc1;
     indexer<ZBUCKETSIZE> dst;
-  
+
     rdtsc0 = __rdtsc();
     offset_t sumsize = 0;
     u8 *degs = tdegs[id];
@@ -813,13 +617,14 @@ public:
     const u32   endvx = NY * (id+1) / nthreads;
     for (u32 vx = startvx; vx < endvx; vx++) {
       TRIMONV ? dst.matrixv(vx) : dst.matrixu(vx);
-      memset(degs, 0, NYZ1);
+      assert(NYZ1 <= sizeof(zbucket8));
+      memset(degs, 0xff, NYZ1);
       for (u32 ux = 0 ; ux < NX; ux++) {
         zbucket<ZBUCKETSIZE> &zb = TRIMONV ? buckets[ux][vx] : buckets[vx][ux];
         u32 *readbig = zb.words, *endreadbig = readbig + zb.size/sizeof(u32);
         // print_log("id %d vx %d ux %d size %d\n", id, vx, ux, zb.size/SRCSIZE);
         for (; readbig < endreadbig; readbig++)
-          degs[*readbig & YZ1MASK] = sizeof(u32);
+          degs[*readbig & YZ1MASK]++;
       }
       for (u32 ux = 0 ; ux < NX; ux++) {
         zbucket<ZBUCKETSIZE> &zb = TRIMONV ? buckets[ux][vx] : buckets[vx][ux];
@@ -833,7 +638,7 @@ public:
 // bit       31...16     15...0
 // write     VYYZZZ'     UYYZZ'   within UX partition
           *(u32 *)(base+dst.index[ux]) = (vyz << YZ1BITS) | (e >> YZ1BITS);
-          dst.index[ux] += degs[vyz ^ 1];
+          dst.index[ux] += degs[vyz] ? sizeof(u32) : 0;
         }
       }
       sumsize += TRIMONV ? dst.storev(buckets, vx) : dst.storeu(buckets, vx);
@@ -849,26 +654,26 @@ public:
     u64 rdtsc0, rdtsc1;
     indexer<ZBUCKETSIZE> dst;
     u32 maxnnid = 0;
-  
+
     rdtsc0 = __rdtsc();
     offset_t sumsize = 0;
-    u8 *degs = tdegs[id];
+    u16 *degs = (u16 *)tdegs[id];
     u8 const *base = (u8 *)buckets;
     const u32 startvx = NY *  id    / nthreads;
     const u32   endvx = NY * (id+1) / nthreads;
     for (u32 vx = startvx; vx < endvx; vx++) {
       TRIMONV ? dst.matrixv(vx) : dst.matrixu(vx);
-      memset(degs, 0, NYZ1);
+      memset(degs, 0xff, 2 * NYZ1); // sets each u16 entry to 0xffff
       for (u32 ux = 0 ; ux < NX; ux++) {
         zbucket<ZBUCKETSIZE> &zb = TRIMONV ? buckets[ux][vx] : buckets[vx][ux];
         u32 *readbig = zb.words, *endreadbig = readbig + zb.size/sizeof(u32);
         // print_log("id %d vx %d ux %d size %d\n", id, vx, ux, zb.size/SRCSIZE);
         for (; readbig < endreadbig; readbig++)
-          degs[*readbig & YZ1MASK] = 1;
+          degs[*readbig & YZ1MASK]++;
       }
-      u32 newnodepairid = 0;
+      u32 newnodeid = 0;
       u32 *renames = TRIMONV ? buckets[0][vx].renamev1 : buckets[vx][0].renameu1;
-      u32 *endrenames = renames + NZ2/2;
+      u32 *endrenames = renames + NZ2;
       for (u32 ux = 0 ; ux < NX; ux++) {
         zbucket<ZBUCKETSIZE> &zb = TRIMONV ? buckets[ux][vx] : buckets[vx][ux];
         u32 *readbig = zb.words, *endreadbig = readbig + zb.size/sizeof(u32);
@@ -877,28 +682,26 @@ public:
 // read      UYYYZZ'     VYYZZ'   within VX partition
           const u32 e = *readbig;
           const u32 vyz = e & YZ1MASK;
-          u16 *pdeg = (u16 *)degs + (vyz >> 1);
-          u16 vdeg = *pdeg;
-          if (vdeg >= 0x0101) {
-            if (vdeg == 0x0101) {
-              *pdeg = vdeg = 0x0102 + newnodepairid++;
-              *renames++ = vyz & ~1;  // neutralize parity, to be restored upon use
+          u16 vdeg = degs[vyz];
+          if (vdeg) {
+            if (vdeg < 32) {
+              degs[vyz] = vdeg = 32 + newnodeid++;
+              *renames++ = vyz;
               if (renames == endrenames) {
                 endrenames += (TRIMONV ? sizeof(yzbucket<ZBUCKETSIZE>) : sizeof(zbucket<ZBUCKETSIZE>)) / sizeof(u32);
-                renames = endrenames - NZ2/2;
-                assert(renames < buckets[NX][NY].renameu1);
+                renames = endrenames - NZ2;
+                assert(renames < buckets[NX][0].renameu1);
               }
             }
-            vdeg = ((vdeg-0x0102) << 1) | (vyz & 1); // preserve parity
 // bit       26...16     15...0
 // write     VYYZZZ"     UYYZZ'   within UX partition
-            *(u32 *)(base+dst.index[ux]) = (vdeg << (TRIMONV ? YZ1BITS : YZ2BITS)) | (e >> YZ1BITS);
+            *(u32 *)(base+dst.index[ux]) = ((vdeg - 32) << (TRIMONV ? YZ1BITS : YZ2BITS)) | (e >> YZ1BITS);
             dst.index[ux] += sizeof(u32);
           }
         }
       }
-      if (2*newnodepairid > maxnnid)
-        maxnnid = 2*newnodepairid;
+      if (newnodeid > maxnnid)
+        maxnnid = newnodeid;
       sumsize += TRIMONV ? dst.storev(buckets, vx) : dst.storeu(buckets, vx);
     }
     rdtsc1 = __rdtsc();
@@ -939,9 +742,10 @@ public:
 #define EXPANDROUND COMPRESSROUND
 #endif
   void trimmer(u32 id) {
-    genUnodes(id, 0);
+      printf("trimmer ... threadId = %d\n", getpid());
+    genUVnodes(id);
     barrier();
-    genVnodes(id, 1);
+    sortVnodes(id, 1);
     for (u32 round = 2; round < ntrims-2; round += 2) {
       barrier();
       if (round < COMPRESSROUND) {
@@ -981,7 +785,7 @@ void *etworker(void *vp) {
 #define NODEBITS (EDGEBITS + 1)
 
 // grow with cube root of size, hardly affected by trimming
-const static u32 MAXPATHLEN = 16 << (EDGEBITS/3);
+const u32 MAXPATHLEN = 16 << (EDGEBITS/3);
 
 int nonce_cmp(const void *a, const void *b) {
   return *(u32 *)a - *(u32 *)b;
@@ -1009,8 +813,17 @@ public:
   std::bitset<NXY> uxymap;
   std::vector<word_t> sols; // concatanation of all proof's indices
 
+#if NSIPHASH > 4  // ensure correct alignment for _mm256_load_si256 of sip_keys at start of trimmer struct
+  void* operator new(size_t size) noexcept {
+    void* newobj;
+    int tmp = posix_memalign(&newobj, NSIPHASH * sizeof(u32), sizeof(solver_ctx));
+    if (tmp != 0) return nullptr;
+    return newobj;
+  }
+#endif
+
   solver_ctx(const u32 nthreads, const u32 n_trims, bool allrounds, bool show_cycle, bool mutate_nonce)
-    : trimmer(nthreads, n_trims, allrounds), 
+    : trimmer(nthreads, n_trims, allrounds),
       cg(MAXEDGES, MAXEDGES, MAXSOLS, (char *)trimmer.tbuckets) {
     assert(cg.bytes() <= sizeof(yzbucket<TBUCKETSIZE>[nthreads])); // check that graph cg can fit in tbucket's memory
     showcycle = show_cycle;
@@ -1033,31 +846,18 @@ public:
   }
   void recordedge(const u32 i, const u32 u1, const u32 v2) {
     const u32 ux = u1 >> YZ2BITS;
-    u32 uyz = trimmer.buckets[ux][(u1 >> Z2BITS) & YMASK].renameu1[(u1 & Z2MASK) >> 1] | (u1 & 1);
+    u32 uyz = trimmer.buckets[ux][(u1 >> Z2BITS) & YMASK].renameu1[u1 & Z2MASK];
     const u32 v1 = v2 - MAXEDGES;
     const u32 vx = v1 >> YZ2BITS;
-    u32 vyz = trimmer.buckets[(v1 >> Z2BITS) & YMASK][vx].renamev1[(v1 & Z2MASK) >> 1] | (v1 & 1);
+    u32 vyz = trimmer.buckets[(v1 >> Z2BITS) & YMASK][vx].renamev1[v1 & Z2MASK];
 #if COMPRESSROUND > 0
-    uyz = trimmer.buckets[ux][uyz >> Z1BITS].renameu[(uyz & Z1MASK) >> 1] | (u1 & 1);
-    vyz = trimmer.buckets[vyz >> Z1BITS][vx].renamev[(vyz & Z1MASK) >> 1] | (v1 & 1);
+    uyz = trimmer.buckets[ux][uyz >> Z1BITS].renameu[uyz & Z1MASK];
+    vyz = trimmer.buckets[vyz >> Z1BITS][vx].renamev[vyz & Z1MASK];
 #endif
     const u32 u = cycleus[i] = (ux << YZBITS) | uyz;
     cyclevs[i] = (vx << YZBITS) | vyz;
     // print_log(" (%x,%x)", u, cyclevs[i]);
-#ifdef SAVEEDGES
-    u32 v = cyclevs[i];
-    u32 *readedges = trimmer.buckets[ux][uyz >> ZBITS].edges, *endreadedges = readedges + NTRIMMEDZ;
-    for (; readedges < endreadedges; readedges++) {
-      u32 edge = *readedges;
-      if (sipnode(&trimmer.sip_keys, edge, 1) == v && sipnode(&trimmer.sip_keys, edge, 0) == u) {
-        sols.push_back(edge);
-        return;
-      }
-    }
-    assert(0);
-#else
     uxymap[u >> ZBITS] = 1;
-#endif
   }
 
   void solution(const proof sol) {
@@ -1066,7 +866,6 @@ public:
       recordedge(i, cg.links[2*sol[i]].to, cg.links[2*sol[i]+1].to);
     // print_log("\n");
     if (showcycle) {
-#ifndef SAVEEDGES
       void *matchworker(void *vp);
 
       sols.resize(sols.size() + PROOFSIZE);
@@ -1081,14 +880,14 @@ public:
         int err = pthread_join(threads[t].thread, NULL);
         assert(err == 0);
       }
-#endif
+      delete[] threads;
       qsort(&sols[sols.size()-PROOFSIZE], PROOFSIZE, sizeof(u32), nonce_cmp);
     }
   }
 
   void findcycles() {
     u64 rdtsc0, rdtsc1;
-  
+
     rdtsc0 = __rdtsc();
     cg.reset();
     for (u32 vx = 0; vx < NX; vx++) {
@@ -1127,121 +926,87 @@ public:
 
   void *matchUnodes(match_ctx *mc) {
     u64 rdtsc0, rdtsc1;
-  
+    const u32 NEBS = NSIPHASH * EDGE_BLOCK_SIZE;
+    alignas(NSIPHASH > 4 ? 4*NSIPHASH : 8) u64 buf[NEBS];
+
     rdtsc0 = __rdtsc();
     const u32 starty = NY *  mc->id    / trimmer.nthreads;
     const u32   endy = NY * (mc->id+1) / trimmer.nthreads;
-    u32 edge = starty << YZBITS, endedge = edge + NYZ;
-  #if NSIPHASH == 4
-    static const __m128i vnodemask = {EDGEMASK, EDGEMASK};
-    siphash_keys &sip_keys = trimmer.sip_keys;
-    __m128i v0, v1, v2, v3, v4, v5, v6, v7;
-    const u32 e2 = 2 * edge;
-    __m128i vpacket0 = _mm_set_epi64x(e2+2, e2+0);
-    __m128i vpacket1 = _mm_set_epi64x(e2+6, e2+4);
-    static const __m128i vpacketinc = {8, 8};
-  #elif NSIPHASH == 8
-    static const __m256i vnodemask = {EDGEMASK, EDGEMASK, EDGEMASK, EDGEMASK};
-    const __m256i vinit = _mm256_load_si256((__m256i *)&trimmer.sip_keys);
-    __m256i v0, v1, v2, v3, v4, v5, v6, v7;
-    const u32 e2 = 2 * edge;
-    __m256i vpacket0 = _mm256_set_epi64x(e2+6, e2+4, e2+2, e2+0);
-    __m256i vpacket1 = _mm256_set_epi64x(e2+14, e2+12, e2+10, e2+8);
-    static const __m256i vpacketinc = {16, 16, 16, 16};
-  #endif
-    for (u32 my = starty; my < endy; my++, endedge += NYZ) {
-      for (; edge < endedge; edge += NSIPHASH) {
-  // bit        28..21     20..13    12..0
-  // node       XXXXXX     YYYYYY    ZZZZZ
-  #if NSIPHASH == 1
-        const u32 nodeu = sipnode(&trimmer.sip_keys, edge, 0);
-        if (uxymap[nodeu >> ZBITS]) {
-          for (u32 j = 0; j < PROOFSIZE; j++) {
-            if (cycleus[j] == nodeu && cyclevs[j] == sipnode(&trimmer.sip_keys, edge, 1)) {
-              sols[sols.size()-PROOFSIZE + j] = edge;
-            }
-          }
+    u32 edge0 = starty << YZBITS, endedge0 = edge0 + NYZ;
+    for (u32 my = starty; my < endy; my++, endedge0 += NYZ) {
+      for (; edge0 < endedge0; edge0 += NEBS) {
+#if NSIPHASH == 1
+        siphash_state shs(trimmer.sip_keys);
+        for (u32 e = 0; e < NEBS; e += NSIPHASH) {
+          shs.hash24(edge0 + e);
+          buf[e] = shs.xor_lanes();
         }
-  // bit        39..21     20..13    12..0
-  // write        edge     YYYYYY    ZZZZZ
-  #elif NSIPHASH == 4
-        v7 = v3 = _mm_set1_epi64x(sip_keys.k3);
-        v4 = v0 = _mm_set1_epi64x(sip_keys.k0);
-        v5 = v1 = _mm_set1_epi64x(sip_keys.k1);
-        v6 = v2 = _mm_set1_epi64x(sip_keys.k2);
-
-        v3 = XOR(v3,vpacket0); v7 = XOR(v7,vpacket1);
-        SIPROUNDX2N; SIPROUNDX2N;
-        v0 = XOR(v0,vpacket0); v4 = XOR(v4,vpacket1);
-        v2 = XOR(v2, _mm_set1_epi64x(0xffLL));
-        v6 = XOR(v6, _mm_set1_epi64x(0xffLL));
-        SIPROUNDX2N; SIPROUNDX2N; SIPROUNDX2N; SIPROUNDX2N;
-        v0 = XOR(XOR(v0,v1),XOR(v2,v3));
-        v4 = XOR(XOR(v4,v5),XOR(v6,v7));
-
-        vpacket0 = _mm_add_epi64(vpacket0, vpacketinc);
-        vpacket1 = _mm_add_epi64(vpacket1, vpacketinc);
-        v0 = v0 & vnodemask;
-        v4 = v4 & vnodemask;
-        v1 = _mm_srli_epi64(v0, ZBITS);
-        v5 = _mm_srli_epi64(v4, ZBITS);
-
-        u32 uxy;
-  #define MATCH(i,v,x,w) \
-  uxy = extract32(v,x);\
-  if (uxymap[uxy]) {\
-    u32 u = extract32(w,x);\
-    for (u32 j = 0; j < PROOFSIZE; j++) {\
-      if (cycleus[j] == u && cyclevs[j] == sipnode(&trimmer.sip_keys, edge+i, 1)) {\
-        sols[sols.size()-PROOFSIZE + j] = edge + i;\
-      }\
-    }\
-  }
-        MATCH(0,v1,0,v0); MATCH(1,v1,2,v0);
-        MATCH(2,v5,0,v4); MATCH(3,v5,2,v4);
-  #elif NSIPHASH == 8
+#elif NSIPHASH == 4
+        const u64 e1 = edge0;
+        const __m128i vpacketinc = _mm_set1_epi64x(1);
+        __m128i v0, v1, v2, v3, v4, v5, v6, v7;
+        v7 = v3 = _mm_set1_epi64x(trimmer.sip_keys.k3);
+        v4 = v0 = _mm_set1_epi64x(trimmer.sip_keys.k0);
+        v5 = v1 = _mm_set1_epi64x(trimmer.sip_keys.k1);
+        v6 = v2 = _mm_set1_epi64x(trimmer.sip_keys.k2);
+        __m128i vpacket0 = _mm_set_epi64x(e1+EDGE_BLOCK_SIZE, e1+0);
+        __m128i vpacket1 = _mm_set_epi64x(e1+3*EDGE_BLOCK_SIZE, e1+2*EDGE_BLOCK_SIZE);
+        for (u32 e = 0; e < NEBS; e += NSIPHASH) {
+          v3 = XOR(v3,vpacket0); v7 = XOR(v7,vpacket1);
+          SIPROUNDX2N; SIPROUNDX2N;
+          v0 = XOR(v0,vpacket0); v4 = XOR(v4,vpacket1);
+          v2 = XOR(v2, _mm_set1_epi64x(0xffLL));
+          v6 = XOR(v6, _mm_set1_epi64x(0xffLL));
+          SIPROUNDX2N; SIPROUNDX2N; SIPROUNDX2N; SIPROUNDX2N;
+          vpacket0 = _mm_add_epi64(vpacket0, vpacketinc);
+          vpacket1 = _mm_add_epi64(vpacket1, vpacketinc);
+          _mm_store_si128((__m128i *)(buf + e),     XOR(XOR(v0,v1),XOR(v2,v3)));
+          _mm_store_si128((__m128i *)(buf + e + 2), XOR(XOR(v4,v5),XOR(v6,v7)));
+        }
+#elif NSIPHASH == 8
+        const u64 e1 = edge0;
+        const __m256i vinit = _mm256_load_si256((__m256i *)&trimmer.sip_keys);
+        const __m256i vpacketinc = _mm256_set1_epi64x(1);
+        __m256i v0, v1, v2, v3, v4, v5, v6, v7;
         v7 = v3 = _mm256_permute4x64_epi64(vinit, 0xFF);
         v4 = v0 = _mm256_permute4x64_epi64(vinit, 0x00);
         v5 = v1 = _mm256_permute4x64_epi64(vinit, 0x55);
         v6 = v2 = _mm256_permute4x64_epi64(vinit, 0xAA);
-
-        v3 = XOR(v3,vpacket0); v7 = XOR(v7,vpacket1);
-        SIPROUNDX2N; SIPROUNDX2N;
-        v0 = XOR(v0,vpacket0); v4 = XOR(v4,vpacket1);
-        v2 = XOR(v2,_mm256_set1_epi64x(0xffLL));
-        v6 = XOR(v6,_mm256_set1_epi64x(0xffLL));
-        SIPROUNDX2N; SIPROUNDX2N; SIPROUNDX2N; SIPROUNDX2N;
-        v0 = XOR(XOR(v0,v1),XOR(v2,v3));
-        v4 = XOR(XOR(v4,v5),XOR(v6,v7));
-  
-        vpacket0 = _mm256_add_epi64(vpacket0, vpacketinc);
-        vpacket1 = _mm256_add_epi64(vpacket1, vpacketinc);
-        v0 = v0 & vnodemask;
-        v4 = v4 & vnodemask;
-        v1 = _mm256_srli_epi64(v0, ZBITS);
-        v5 = _mm256_srli_epi64(v4, ZBITS);
-  
-        u32 uxy;
-  #define MATCH(i,v,x,w) \
-  uxy = _mm256_extract_epi32(v,x);\
-  if (uxymap[uxy]) {\
-    u32 u = _mm256_extract_epi32(w,x);\
-    for (u32 j = 0; j < PROOFSIZE; j++) {\
-      if (cycleus[j] == u && cyclevs[j] == sipnode(&trimmer.sip_keys, edge+i, 1)) {\
-        sols[sols.size()-PROOFSIZE + j] = edge + i;\
-      }\
-    }\
-  }
-        MATCH(0,v1,0,v0); MATCH(1,v1,2,v0); MATCH(2,v1,4,v0); MATCH(3,v1,6,v0);
-        MATCH(4,v5,0,v4); MATCH(5,v5,2,v4); MATCH(6,v5,4,v4); MATCH(7,v5,6,v4);
-  #else
-  #error not implemented
-  #endif
+        __m256i vpacket0 = _mm256_set_epi64x(e1+3*EDGE_BLOCK_SIZE, e1+2*EDGE_BLOCK_SIZE, e1+EDGE_BLOCK_SIZE, e1+0);
+        __m256i vpacket1 = _mm256_set_epi64x(e1+7*EDGE_BLOCK_SIZE, e1+6*EDGE_BLOCK_SIZE, e1+5*EDGE_BLOCK_SIZE, e1+4*EDGE_BLOCK_SIZE);
+        for (u32 e = 0; e < NEBS; e += NSIPHASH) {
+          v3 = XOR(v3,vpacket0); v7 = XOR(v7,vpacket1);
+          SIPROUNDX2N; SIPROUNDX2N;
+          v0 = XOR(v0,vpacket0); v4 = XOR(v4,vpacket1);
+          v2 = XOR(v2,_mm256_set1_epi64x(0xffLL));
+          v6 = XOR(v6,_mm256_set1_epi64x(0xffLL));
+          SIPROUNDX2N; SIPROUNDX2N; SIPROUNDX2N; SIPROUNDX2N;
+          vpacket0 = _mm256_add_epi64(vpacket0, vpacketinc);
+          vpacket1 = _mm256_add_epi64(vpacket1, vpacketinc);
+          _mm256_store_si256((__m256i *)(buf + e),     XOR(XOR(v0,v1),XOR(v2,v3)));
+          _mm256_store_si256((__m256i *)(buf + e + 4), XOR(XOR(v4,v5),XOR(v6,v7)));
+        }
+#endif
+        for (u32 ns = 0; ns < NSIPHASH; ns++) {
+          const u64 buflast = buf[NEBS - NSIPHASH + ns];
+          buf[NEBS - NSIPHASH + ns] = 0;
+          for (u32 e = 0; e < NEBS; e += NSIPHASH) {
+            const u64 nodes = buf[e + ns] ^ buflast;
+            const u32 node0 = nodes & EDGEMASK;
+            const u32 node1 = (nodes >> 32) & EDGEMASK;
+            if (uxymap[node0 >> ZBITS]) {
+              for (u32 j = 0; j < PROOFSIZE; j++) {
+                if (cycleus[j] == node0 && cyclevs[j] == node1) {
+                  sols[sols.size()-PROOFSIZE + j] = edge0 + ns * EDGE_BLOCK_SIZE + e/NSIPHASH;
+                }
+              }
+            }
+          }
+        }
       }
     }
     rdtsc1 = __rdtsc();
     if (trimmer.showall || !mc->id) print_log("matchUnodes id %d rdtsc: %lu\n", mc->id, rdtsc1-rdtsc0);
-    pthread_exit(NULL);
     return 0;
   }
 };
