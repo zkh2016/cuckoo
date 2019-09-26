@@ -49,7 +49,7 @@ const u32 NZ        = 1 << ZBITS;
 const u32 ZMASK     = NZ - 1;
 
 #ifndef NEPS_A
-#define NEPS_A 166
+#define NEPS_A 160
 #endif
 #ifndef NEPS_B
 #define NEPS_B 92
@@ -739,6 +739,39 @@ struct edgetrimmer {
     cudaDeviceReset();
   }
 
+void save_to_file(uint2* mem, size_t offset1, u32* indexes, size_t offset2, size_t indexesSize){
+	u32 *tindexs = new u32[NX2*NZ];
+	uint2 *tmpbuf = new uint2[sizeA];
+	cudaMemcpy(tindexs, indexes, indexesSize, cudaMemcpyDeviceToHost); 
+	FILE *fp = fopen("cuda.txt", "w");
+	for(int i = 0; i < NX2 * NZ; i++){
+		size_t size = (tindexs[i] > EDGES_A ? EDGES_A : tindexs[i]) * sizeof(uint2);
+		cudaMemcpy(tmpbuf, mem + i * EDGES_A, size, cudaMemcpyDeviceToHost);
+		for(int j = 0; j < size/sizeof(uint2); j++){
+			if(tmpbuf[j].y != 0 || tmpbuf[j].x != 0)
+			fprintf(fp, "%u %u\n", tmpbuf[j].y, tmpbuf[j].x);
+		}
+	}
+	fclose(fp);
+	delete tindexs;
+	delete tmpbuf;
+}
+void test(u32* two_bit_set){
+	u32* bitset = new u32[NX2*NZ/4/sizeof(u32)];
+	//clEnqueueReadBuffer(commandQueue, two_bit_set, CL_TRUE, 0, NX2*NZ/4, bitset, 0, NULL, NULL);
+	cudaMemcpy(bitset, two_bit_set, NX2*NZ/4, cudaMemcpyDeviceToHost);
+	FILE *fp = fopen("cuda_two_bit_set.txt", "w");
+	for(int i = 0; i < NX2; i++){
+		for(int j = 0; j < NZ/32; j++){
+			u32 tmp = bitset[i*NZ/16 + NZ/32+j];
+			for(int k = 31; k >= 0; k--){
+				fprintf(fp, "%u\n", (tmp>>k) & 1);
+			}
+		}
+	}  
+	fclose(fp);
+	delete bitset;
+}
   void check_repeat(u32 *dindexes, uint2 *dbuffer, u32 maxOut){
 return;
 		u32 *hindexes = new u32[NX*NY];
@@ -767,7 +800,19 @@ return;
 		}
 		if(flag) exit(0);
   }
+	void count_edges(u32 *indexesE, u32 maxIn){
+return;
+		u32 *tmpindex = new u32[NX2];
+    cudaMemcpy(tmpindex, indexesE, NX*NY*sizeof(u32), cudaMemcpyDeviceToHost);
+    u32 sum = 0;
+    for(int i = 0; i < NX*NY; i++){
+        sum += tmpindex[i] > maxIn ? maxIn : tmpindex[i];
+    }
+    printf("edges count : %llu\n", sum);
+		delete tmpindex;
+	}
   u32 trim() {
+	printf("%lu %lu %lu %lu\n", sipkeys.k0, sipkeys.k1, sipkeys.k2, sipkeys.k3);
     cudaMemcpy(dipkeys, &sipkeys, sizeof(sipkeys), cudaMemcpyHostToDevice);
     cudaDeviceSynchronize();
   
@@ -791,6 +836,8 @@ return;
             SeedA1<EDGES_A><<<tp.genA.blocks, tp.genA.tpb>>>(round, i, *dipkeys, (ulonglong4*)bufferAB, indexesE[1], one_bit_set);
             checkCudaErrors(cudaDeviceSynchronize()); 
 
+						//save_to_file((uint2*)bufferAB, 0, indexesE[1], 0, indexesSize);
+						//return 0;
 					//	printf("seed a1 %d %d\n", round, i);
 					//	check_repeat(indexesE[1], (uint2*)bufferAB, EDGES_A);
 
@@ -803,6 +850,8 @@ return;
             }
             checkCudaErrors(cudaDeviceSynchronize()); 
 
+						//save_to_file((uint2*)bufferA, 0, indexesE[0], 0, indexesSize);
+						//return 0;
 					//	printf("seed b %d %d\n", round, i);
 					//	check_repeat(indexesE[0], (uint2*)bufferA, EDGES_A);
 
@@ -841,12 +890,12 @@ return;
 
             Round1<EDGES_A><<<tp.trim.blocks, tp.trim.tpb>>>(round, (uint2*)bufferA, indexesE[0], two_bit_set, one_bit_set);
             checkCudaErrors(cudaDeviceSynchronize()); 
-				//		cudaMemcpy(tmp64, one_bit_set, NX2 * NZ / 8, cudaMemcpyDeviceToHost);
-				//		surviving=0;
-				//		for (uint32_t i=0; i<NX2 * NZ/64; i++) {
-				//						surviving += __builtin_popcountll(tmp64[i]);
-				//		}
-				//		printf("round02 surviving = %llu\n", surviving);
+		//				cudaMemcpy(tmp64, one_bit_set, NX2 * NZ / 8, cudaMemcpyDeviceToHost);
+		//				surviving=0;
+		//				for (uint32_t i=0; i<NX2 * NZ/64; i++) {
+		//								surviving += __builtin_popcountll(tmp64[i]);
+		//				}
+		//				printf("round02 surviving = %llu\n", surviving);
         }
     }
 
@@ -854,13 +903,7 @@ return;
     SeedA<EDGES_A><<<tp.genA.blocks, tp.genA.tpb>>>(0, 0, *dipkeys, (ulonglong4*)bufferAB, indexesE[1], one_bit_set);
     checkCudaErrors(cudaDeviceSynchronize()); 
 
-//		u32 *tmpindex = new u32[NX*NY];
-//		cudaMemcpy(tmpindex, indexesE[1], indexesSize, cudaMemcpyDeviceToHost);
-//		u32 sum = 0;
-//		for(int i = 0; i < NX*NY; i++){
-//			sum += tmpindex[i];
-//			if(tmpindex[i] > EDGES_A) printf("%u\n", tmpindex[i] - EDGES_A);
-//		}
+		count_edges(indexesE[1], EDGES_A);
 		//printf("seeda check repeat...\n");
 		check_repeat(indexesE[1], (uint2*)bufferAB, EDGES_A);
 
@@ -874,16 +917,12 @@ return;
     }
     checkCudaErrors(cudaDeviceSynchronize()); 
 
+		count_edges(indexesE[0], EDGES_A);
 		//printf("seedb check repeat...\n");
 		check_repeat(indexesE[0], (uint2*)bufferA, EDGES_A);
   
-//    cudaMemcpy(tmpindex, indexesE[0], NX*NY*sizeof(u32), cudaMemcpyDeviceToHost);
-//    sum = 0;
-//    for(int i = 0; i < NX*NY; i++){
-//        sum += tmpindex[i] > EDGES_A ? EDGES_A : tmpindex[i];
-//    }
-//    printf("seedB : %llu\n", sum);
 
+		printf("round0...\n");
     cudaMemset(indexesE[2], 0, indexesSize);
     qA = sizeA * NRB2 / NX;
     qE = NY * NRB2;
@@ -893,14 +932,8 @@ return;
       if (abort) return false;
     }
 
-		//printf("round2 check repeat...\n");
+		count_edges(indexesE[2], EDGES_B*NRB1/NX);
 		check_repeat(indexesE[2], (uint2*)(bufferA+sizeA), EDGES_B*NRB1/NX);
-//    cudaMemcpy(tmpindex, indexesE[2], NX*NY*sizeof(u32), cudaMemcpyDeviceToHost);
-//    sum = 0;
-//    for(int i = 0; i < NX*NY; i++){
-//        sum += tmpindex[i];
-//    }
-//    printf("Round1: %llu\n", sum);
 
     cudaMemset(indexesE[1], 0, indexesSize);
 
@@ -909,24 +942,21 @@ return;
             (0, part, *dipkeys, (uint2*)bufferA, (uint2*)bufferB, indexesE[0], indexesE[1]); // to .632
       if (abort) return false;
     }
-		//printf("round3 check repeat...\n");
+		count_edges(indexesE[1], EDGES_B*NRB2/NX);
 		check_repeat(indexesE[1], (uint2*)(bufferB), EDGES_B*NRB2/NX);
 
-//    cudaMemcpy(tmpindex, indexesE[1], NX*NY*sizeof(u32), cudaMemcpyDeviceToHost);
-//    sum = 0;
-//    for(int i = 0; i < NX*NY; i++){
-//        sum += tmpindex[i];
-//    }
-//    printf("Round2: %llu\n", sum);
 
     cudaMemset(indexesE[0], 0, indexesSize);
 
+		printf("round1...\n");
     for (u32 part = 0; part <= PART_MASK; part++) {
         Round2<EDGES_B*NRB2/NX, EDGES_B*NRB1/NX, uint2, EDGES_B/2, uint2><<<tp.trim.blocks, tp.trim.tpb, BITMAPBYTES>>>(1, part, *dipkeys, (uint2*)bufferB, (uint2*)bufferA, indexesE[1], indexesE[0]); // to .296
       if (abort) return false;
     }
 
 		//printf("round4 check repeat...\n");
+		printf("round1 count...\n");
+		count_edges(indexesE[0], EDGES_B/2);
 		check_repeat(indexesE[0], (uint2*)(bufferA), EDGES_B/2);
 //    cudaMemcpy(tmpindex, indexesE[0], NX*NY*sizeof(u32), cudaMemcpyDeviceToHost);
 //    sum = 0;
@@ -937,10 +967,12 @@ return;
 
     cudaMemset(indexesE[1], 0, indexesSize);
 
+		printf("round2...\n");
     for (u32 part = 0; part <= PART_MASK; part++) {
         Round<EDGES_B/2, uint2, EDGES_A/4, uint2><<<tp.trim.blocks, tp.trim.tpb, BITMAPBYTES>>>(2, part, *dipkeys, (uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]); // to .176
       if (abort) return false;
 		//printf("round5 check repeat...\n");
+		count_edges(indexesE[1], EDGES_A/4);
 		check_repeat(indexesE[1], (uint2*)(bufferB), EDGES_A/4);
 
 //    cudaMemcpy(tmpindex, indexesE[1], NX*NY*sizeof(u32), cudaMemcpyDeviceToHost);
@@ -953,6 +985,7 @@ return;
     }
 
     cudaMemset(indexesE[0], 0, indexesSize);
+		printf("round3...\n");
 
     for (u32 part = 0; part <= PART_MASK; part++) {
       Round<EDGES_A/4, uint2, EDGES_B/4, uint2><<<tp.trim.blocks, tp.trim.tpb, BITMAPBYTES>>>(3, part, *dipkeys, (uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]); // to .117
@@ -960,6 +993,7 @@ return;
     }
   
     cudaDeviceSynchronize();
+		count_edges(indexesE[0], EDGES_B/4);
   
     for (int round = 4; round < tp.ntrims; round += 2) {
       cudaMemset(indexesE[1], 0, indexesSize);
@@ -973,6 +1007,7 @@ return;
         if (abort) return false;
       }
     }
+		count_edges(indexesE[0], EDGES_B/4);
     
 //    cudaMemcpy(tmpindex, indexesE[0], NX*NY*sizeof(u32), cudaMemcpyDeviceToHost);
 //    sum = 0;

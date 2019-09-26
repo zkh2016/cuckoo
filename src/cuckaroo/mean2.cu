@@ -432,6 +432,35 @@ __global__ void Tail(const uint2 *source, uint2 *destination, const u32 *sourceI
   for (int i = lid; i < myEdges; i += dim)
     destination[destIdx + lid] = source[group * maxIn + lid];
 }
+__global__ void SeedA3(const siphash_keys &sipkeys) {
+  const int group = blockIdx.x;
+  const int dim = blockDim.x;
+  const int lid = threadIdx.x;
+  const int gid = group * dim + lid;
+  const int nthreads = gridDim.x * dim;
+  const int FLUSHA2 = 2*FLUSHA;
+
+  __shared__ uint2 tmp[NX][FLUSHA2]; // needs to be ulonglong4 aligned
+  const int TMPPERLL4 = sizeof(ulonglong4) / sizeof(uint2);
+  __shared__ int counters[NX];
+  u64 buf[EDGE_BLOCK_SIZE];
+
+  for (int row = lid; row < NX; row += dim)
+    counters[row] = 0;
+  __syncthreads();
+
+  const int col = group % NY;
+  const int loops = NEDGES / nthreads; // assuming THREADS_HAVE_EDGES checked
+  for (int i = 0; i < loops; i+=EDGE_BLOCK_SIZE) {
+      u32 nonce = gid * loops + i;
+      const u64 last = dipblock(sipkeys, nonce, buf);
+      for(u32 e = 0; e < EDGE_BLOCK_SIZE; e++){
+          u64 edge = buf[e] ^ last;
+          u32 node0 = edge & EDGEMASK;
+          u32 node1 = (edge >> 32) & EDGEMASK;
+			}
+	}
+}
 
 #define checkCudaErrors_V(ans) ({if (gpuAssert((ans), __FILE__, __LINE__) != cudaSuccess) return;})
 #define checkCudaErrors_N(ans) ({if (gpuAssert((ans), __FILE__, __LINE__) != cudaSuccess) return NULL;})
@@ -738,6 +767,9 @@ struct edgetrimmer {
     Tail<EDGES_B/4><<<tp.tail.blocks, tp.tail.tpb>>>((const uint2 *)bufferA, (uint2 *)bufferB, (const u32 *)indexesE[0], (u32 *)indexesE[1]);
     cudaMemcpy(&nedges, indexesE[1], sizeof(u32), cudaMemcpyDeviceToHost);
     //cudaDeviceSynchronize();
+		for(int i = 0; i < 10; i++){
+    	SeedA3<<<tp.genA.blocks, tp.genA.tpb>>>(*dipkeys);
+		}
     return nedges;
   }
 };
